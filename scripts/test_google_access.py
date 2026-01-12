@@ -1,8 +1,13 @@
 import os
 import sys
 import json
+from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+
+load_dotenv()
+if not os.environ.get("SPREADSHEET_ID"):
+    load_dotenv(dotenv_path=os.path.abspath(".env.example"), override=False)
 
 # Use env vars if available; fall back to sensible defaults for local dev
 SA_PATH = os.environ.get("GOOGLE_SA_FILE") or os.path.expanduser("~/Desktop/service-account.json")
