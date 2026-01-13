@@ -11,6 +11,8 @@ from src.backend.v4.use_cases.mer_review_checks import (
     pick_latest_month_header,
     check_petty_cash_matches,
     check_reconciled_zero_by_substring,
+    check_zero_on_both_sides_by_substring,
+    check_bank_balance_matches,
 )
 
 
@@ -117,3 +119,41 @@ def test_check_reconciled_zero_by_substring_fails_if_qbo_missing() -> None:
         rule="Undeposited funds should be zero and match",
     )
     assert res.passed is False
+
+
+def test_check_zero_on_both_sides_by_substring_passes_when_both_zero() -> None:
+    mer_lines = [("Etsy Clearing", "0.00")]
+    qbo_items = [ReportLineItem(label="Etsy Clearing", amount="0.00")]
+
+    res = check_zero_on_both_sides_by_substring(
+        check_id="UC-01",
+        mer_lines=mer_lines,
+        qbo_lines=qbo_items,
+        label_substring="clearing",
+        rule="Clearing should be zero on both MER and QBO",
+    )
+    assert res.passed is True
+    assert res.details["applicable"] is True
+    assert res.details["mer_found"] is True
+    assert res.details["qbo_found"] is True
+
+
+def test_check_zero_on_both_sides_by_substring_fails_when_mer_nonzero() -> None:
+    mer_lines = [("Undeposited Funds", "10.00")]
+    qbo_items = [ReportLineItem(label="Undeposited Funds", amount="0.00")]
+
+    res = check_zero_on_both_sides_by_substring(
+        check_id="UC-03",
+        mer_lines=mer_lines,
+        qbo_lines=qbo_items,
+        label_substring="undeposited",
+        rule="Undeposited should be zero on both MER and QBO",
+    )
+    assert res.passed is False
+
+
+def test_check_bank_balance_matches() -> None:
+    res = check_bank_balance_matches(
+        mer_amount=Decimal("100.00"), qbo_amount=Decimal("100.01"), tolerance=Decimal("0.01")
+    )
+    assert res.passed is True

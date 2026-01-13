@@ -11,6 +11,7 @@ This document turns your current "what are we testing" table into explicit, test
 ## Shared Definitions
 
 - **MER Period End Date**: the month-end date for the MER being reviewed (e.g. `2025-11-30`).
+- **Balance Sheet timing**: checks are evaluated *as-of* the MER period end date. A start date is not required for Balance Sheet validation.
 - **Realm ID / Company ID (QBO)**: the `realmId` value returned by Intuit OAuth. This identifies the QBO company file.
 - **Source-of-truth**:
   - MER expected values come from the MER Google Sheet.
@@ -28,17 +29,16 @@ This document turns your current "what are we testing" table into explicit, test
 - MER Google Sheet: which clearing account(s) should be checked (either explicit list or a location in the sheet)
 
 **Data Sources**
-- MER Google Sheet (expected = 0, and optionally which account names)
-- QBO Balance Sheet report (as-of end date) and/or QBO Chart of Accounts
+- MER Google Sheet Balance Sheet (expected = 0)
+- QBO Balance Sheet report (as-of end date)
 
-**Proposed QBO Retrieval**
+**QBO Retrieval**
 - Balance sheet: `GET /v3/company/{realmId}/reports/BalanceSheet?end_date=YYYY-MM-DD`
-- If Balance Sheet line labels don’t map cleanly: use accounts (Query endpoint) to locate clearing accounts by name/type.
 
 **Check Logic (deterministic)**
-1. Determine the list of clearing accounts to evaluate (config, or parse from MER sheet).
-2. Fetch QBO balances as-of end date.
-3. For each clearing account, compute absolute value and compare to tolerance (e.g. `<= 0.01`).
+1. From MER Balance Sheet, identify any line(s) whose label contains `clearing` (case-insensitive) and sum them.
+2. From QBO Balance Sheet, identify any line(s) whose label contains `clearing` (case-insensitive) and sum them.
+3. Flag if either side is non-zero beyond tolerance.
 
 **Outputs**
 - Pass/fail per clearing account + balance
@@ -68,14 +68,13 @@ This document turns your current "what are we testing" table into explicit, test
 - MER Google Sheet (lists accounts and/or reconciliation expectations)
 - QBO (reconciliation status)
 
-**Important Note (API uncertainty)**
-- QBO’s UI shows reconciliation history, but the public API support for reconciliation “history report” can be limited.
-- MVP strategy: define exactly what we can reliably fetch via API (e.g., last reconciled date per account) and align the check to that.
+**MVP Alternative (API-available)**
+- Instead of fetching the Reconciliation Report (UI-only), compare the MER Balance Sheet bank account balance to the QBO Balance Sheet bank account balance (book value) as-of the same period end date.
 
 **MVP Check Logic (practical)**
-1. Get list of bank accounts.
-2. For each bank account, obtain the latest reconciliation cutoff date (if available via API/report).
-3. Pass if cutoff date >= period end date.
+1. Identify which bank account line(s) in MER should be checked (explicit list or row keys).
+2. Fetch QBO Balance Sheet as-of end date.
+3. For each bank account, compare MER amount to QBO Balance Sheet amount within tolerance.
 
 **Outputs**
 - Pass/fail per bank account + last reconciled date found
@@ -95,15 +94,16 @@ This document turns your current "what are we testing" table into explicit, test
 - MER period end date
 
 **Data Sources**
+- MER Google Sheet Balance Sheet (expected = 0)
 - QBO Balance Sheet report (source-of-truth)
 
 **Retrieval**
 - Balance sheet: `GET /v3/company/{realmId}/reports/BalanceSheet?end_date=YYYY-MM-DD`
 
 **Check Logic**
-1. Fetch QBO balance sheet for end date.
-2. Locate the undeposited funds line item (label may vary).
-3. Pass if value is within tolerance.
+1. From MER Balance Sheet, identify any line(s) whose label contains `undeposited` (case-insensitive) and sum them.
+2. From QBO Balance Sheet, locate the undeposited funds line item(s) (label may vary) and sum them.
+3. Flag if either side is non-zero beyond tolerance.
 
 **Outputs**
 - Pass/fail + amount

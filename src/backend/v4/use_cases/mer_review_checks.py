@@ -305,3 +305,89 @@ def check_reconciled_zero_by_substring(
             "qbo_matches": qbo_matches,
         },
     )
+
+
+def check_zero_on_both_sides_by_substring(
+    *,
+    check_id: str,
+    mer_lines: Iterable[tuple[str, str | None]],
+    qbo_lines: Iterable[ReportLineItem],
+    label_substring: str,
+    tolerance: Decimal = Decimal("0.01"),
+    rule: str,
+) -> CheckResult:
+    """Two-sided Balance Sheet check: flag if either side is non-zero.
+
+    Updated semantics (per clarified requirements):
+    - Source values come from MER Balance Sheet and QBO Balance Sheet (as-of end date).
+    - We do not require MER and QBO totals to be equal; we require each side to be near-zero.
+    - Applicable if either side contains at least one matching line.
+    """
+
+    mer_matches, mer_total = _collect_matches_by_substring(
+        items=mer_lines, label_substring=label_substring, tolerance=tolerance
+    )
+    qbo_matches, qbo_total = _collect_matches_by_substring(
+        items=((i.label, i.amount) for i in qbo_lines),
+        label_substring=label_substring,
+        tolerance=tolerance,
+    )
+
+    mer_found = bool(mer_matches)
+    qbo_found = bool(qbo_matches)
+    applicable = mer_found or qbo_found
+
+    passed = (not applicable) or (
+        is_zero(mer_total, tolerance=tolerance)
+        and is_zero(qbo_total, tolerance=tolerance)
+    )
+
+    return CheckResult(
+        check_id=check_id,
+        passed=passed,
+        details={
+            "rule": rule,
+            "label_substring": label_substring,
+            "tolerance": str(tolerance),
+            "applicable": applicable,
+            "mer_found": mer_found,
+            "qbo_found": qbo_found,
+            "mer_total": str(mer_total),
+            "qbo_total": str(qbo_total),
+            "mer_matches": mer_matches,
+            "qbo_matches": qbo_matches,
+        },
+    )
+
+
+def check_bank_balance_matches(
+    *,
+    mer_amount: Decimal | None,
+    qbo_amount: Decimal | None,
+    tolerance: Decimal = Decimal("0.01"),
+) -> CheckResult:
+    """UC-02 (MVP alternative): MER bank balance matches QBO book balance.
+
+    Note: this does NOT verify 'reconciliation report statement ending balance'.
+    It compares the MER Balance Sheet bank line item against the QBO Balance Sheet
+    bank line item (book balance) as-of the same end date.
+    """
+
+    if mer_amount is None or qbo_amount is None:
+        passed = False
+    else:
+        passed = abs(mer_amount - qbo_amount) <= tolerance
+
+    return CheckResult(
+        check_id="UC-02",
+        passed=passed,
+        details={
+            "rule": "MER bank balance should match QBO book balance at period end",
+            "tolerance": str(tolerance),
+            "mer_amount": str(mer_amount) if mer_amount is not None else None,
+            "qbo_amount": str(qbo_amount) if qbo_amount is not None else None,
+            "delta": str((mer_amount - qbo_amount))
+            if mer_amount is not None and qbo_amount is not None
+            else None,
+        },
+    )
