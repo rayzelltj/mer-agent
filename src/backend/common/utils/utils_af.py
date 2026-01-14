@@ -15,14 +15,15 @@ from v4.magentic_agents.foundry_agent import (
 logging.basicConfig(level=logging.INFO)
 
 
-async def find_first_available_team(team_service: TeamService, user_id: str) -> str:
+async def find_first_available_team(team_service: TeamService, user_id: str) -> str | None:
     """
     Check teams in priority order and return the first available team ID.
     First tries default teams in priority order, then falls back to any available team.
-    Priority: RFP (4) -> Retail (3) -> Marketing (2) -> HR (1) -> Any available team
+    Priority: MER Review -> legacy template teams -> any available team
     """
     # Standard team priority order
     team_priority_order = [
+        "mer-review-team",  # Enkel MER Review (single-team setup)
         "00000000-0000-0000-0000-000000000004",  # RFP
         "00000000-0000-0000-0000-000000000003",  # Retail
         "00000000-0000-0000-0000-000000000002",  # Marketing

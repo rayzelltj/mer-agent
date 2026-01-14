@@ -58,6 +58,15 @@ def test_check_undeposited_funds_zero() -> None:
     assert res.passed is True
 
 
+def test_check_undeposited_funds_zero_requires_all_matching_lines_zero() -> None:
+    items = [
+        ReportLineItem(label="Undeposited Funds", amount="0.00"),
+        ReportLineItem(label="Undeposited Funds - secondary", amount="1.00"),
+    ]
+    res = check_undeposited_funds_zero(balance_sheet_items=items)
+    assert res.passed is False
+
+
 def test_checks_not_applicable_when_line_missing() -> None:
     items: list[ReportLineItem] = [ReportLineItem(label="Cash", amount="1.00")]
 

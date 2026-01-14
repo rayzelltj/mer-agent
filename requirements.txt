@@ -3,7 +3,9 @@ google-auth==2.22.0
 google-auth-httplib2==0.1.0
 azure-identity==1.16.0
 azure-keyvault-secrets>=4.10.0,<5.0
+openai>=1.40.0,<2.0.0
 pytest==7.4.2
 requests==2.31.0
 python-dotenv==1.0.0
 intuit-oauth==1.2.6
+PyYAML==6.0.2

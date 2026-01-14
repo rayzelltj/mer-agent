@@ -261,8 +261,8 @@ def main() -> int:
     print(f"APPLICABLE: {uc01.details.get('applicable')}")
     print(f"MER FOUND lines: {uc01.details.get('mer_found')}")
     print(f"QBO FOUND lines: {uc01.details.get('qbo_found')}")
-    print(f"MER total: {uc01.details.get('mer_total')}")
-    print(f"QBO total: {uc01.details.get('qbo_total')}")
+    print(f"MER matches: {len(uc01.details.get('mer_matches') or [])}")
+    print(f"QBO matches: {len(uc01.details.get('qbo_matches') or [])}")
     print(f"PASSED: {uc01.passed}")
 
     # UC-03: Undeposited Funds should be zero
@@ -277,8 +277,8 @@ def main() -> int:
     print(f"APPLICABLE: {uc03.details.get('applicable')}")
     print(f"MER FOUND lines: {uc03.details.get('mer_found')}")
     print(f"QBO FOUND lines: {uc03.details.get('qbo_found')}")
-    print(f"MER total: {uc03.details.get('mer_total')}")
-    print(f"QBO total: {uc03.details.get('qbo_total')}")
+    print(f"MER matches: {len(uc03.details.get('mer_matches') or [])}")
+    print(f"QBO matches: {len(uc03.details.get('qbo_matches') or [])}")
     print(f"PASSED: {uc03.passed}")
 
     # UC-02: Bank balance matches (optional single-account check)

@@ -7,16 +7,30 @@ from typing import List, Optional
 
 # agent_framework imports
 from agent_framework_azure_ai import AzureAIAgentClient
-from agent_framework import (
-    ChatMessage,
-    WorkflowOutputEvent,
-    MagenticBuilder,
-    InMemoryCheckpointStorage,
-    MagenticOrchestratorMessageEvent,
-    MagenticAgentDeltaEvent,
-    MagenticAgentMessageEvent,
-    MagenticFinalResultEvent,
-)
+
+# NOTE: agent_framework is a prerelease library and its exported symbols can vary
+# between versions. We load attributes via getattr to keep the backend importable
+# even when optional Magentic event types are missing.
+try:
+    import agent_framework as _af
+except ModuleNotFoundError:  # pragma: no cover
+    _af = None
+
+
+def _af_attr(name: str):  # pragma: no cover
+    if _af is None:
+        return object
+    return getattr(_af, name, object)
+
+
+ChatMessage = _af_attr("ChatMessage")
+WorkflowOutputEvent = _af_attr("WorkflowOutputEvent")
+MagenticBuilder = _af_attr("MagenticBuilder")
+InMemoryCheckpointStorage = _af_attr("InMemoryCheckpointStorage")
+MagenticOrchestratorMessageEvent = _af_attr("MagenticOrchestratorMessageEvent")
+MagenticAgentDeltaEvent = _af_attr("MagenticAgentDeltaEvent")
+MagenticAgentMessageEvent = _af_attr("MagenticAgentMessageEvent")
+MagenticFinalResultEvent = _af_attr("MagenticFinalResultEvent")
 
 from common.config.app_config import config
 from common.models.messages_af import TeamConfiguration

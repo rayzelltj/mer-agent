@@ -3,8 +3,6 @@ import logging
 
 from contextlib import asynccontextmanager
 
-
-from azure.monitor.opentelemetry import configure_azure_monitor
 from common.config.app_config import config
 from common.models.messages_af import UserLanguage
 
@@ -15,9 +13,6 @@ from fastapi.middleware.cors import CORSMiddleware
 # Local imports
 from middleware.health_check import HealthCheckMiddleware
 from v4.api.router import app_v4
-
-# Azure monitoring
-
 
 from v4.config.agent_registry import agent_registry
 
@@ -46,14 +41,23 @@ async def lifespan(app: FastAPI):
     logger.info("👋 MACAE application shutdown complete")
 
 
-# Check if the Application Insights Instrumentation Key is set in the environment variables
 connection_string = config.APPLICATIONINSIGHTS_CONNECTION_STRING
 if connection_string:
-    # Configure Application Insights if the Instrumentation Key is found
-    configure_azure_monitor(connection_string=connection_string)
-    logging.info(
-        "Application Insights configured with the provided Instrumentation Key"
-    )
+    # Configure Application Insights if available.
+    # NOTE: In local dev, dependency version mismatches can cause import-time crashes.
+    # Keep this best-effort so the app can still start.
+    try:
+        from azure.monitor.opentelemetry import configure_azure_monitor
+
+        configure_azure_monitor(connection_string=connection_string)
+        logging.info(
+            "Application Insights configured with the provided Instrumentation Key"
+        )
+    except Exception as e:
+        logging.warning(
+            "Skipping Application Insights configuration (Azure Monitor import/setup failed): %s",
+            e,
+        )
 else:
     # Log a warning if the Instrumentation Key is not found
     logging.warning(

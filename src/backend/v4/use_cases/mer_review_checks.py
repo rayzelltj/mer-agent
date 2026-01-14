@@ -181,19 +181,28 @@ def check_undeposited_funds_zero(
     candidates = [
         item for item in balance_sheet_items if "undeposited" in item.label.lower()
     ]
-    applicable = bool(candidates)
-    amount = parse_money(candidates[0].amount) if candidates else None
+    matches: list[dict] = []
+    for item in candidates:
+        amt = parse_money(item.amount)
+        matches.append(
+            {
+                "label": item.label,
+                "amount_raw": item.amount,
+                "amount": str(amt) if amt is not None else None,
+                "is_zero": is_zero(amt, tolerance=tolerance),
+            }
+        )
+
+    applicable = bool(matches)
 
     return CheckResult(
         check_id="UC-03",
-        passed=(not applicable) or is_zero(amount, tolerance=tolerance),
+        passed=(not applicable) or all(m["is_zero"] for m in matches),
         details={
             "rule": "Undeposited funds should be zero at period end",
             "applicable": applicable,
             "tolerance": str(tolerance),
-            "found_label": candidates[0].label if candidates else None,
-            "amount_raw": candidates[0].amount if candidates else None,
-            "amount": str(amount) if amount is not None else None,
+            "matches": matches,
         },
     )
 
@@ -226,19 +235,16 @@ def check_petty_cash_matches(
     )
 
 
-def _collect_matches_by_substring(
+def _collect_line_matches_by_substring(
     *,
     items: Iterable[tuple[str, str | None]],
     label_substring: str,
     tolerance: Decimal,
-) -> tuple[list[dict], Decimal]:
+) -> list[dict]:
     matches: list[dict] = []
-    total = Decimal("0")
     for label, amount_raw in items:
         if label_substring.lower() in (label or "").lower():
             amt = parse_money(amount_raw)
-            if amt is not None:
-                total += amt
             matches.append(
                 {
                     "label": label,
@@ -247,7 +253,7 @@ def _collect_matches_by_substring(
                     "is_zero": is_zero(amt, tolerance=tolerance),
                 }
             )
-    return matches, total
+    return matches
 
 
 def check_reconciled_zero_by_substring(
@@ -259,18 +265,22 @@ def check_reconciled_zero_by_substring(
     tolerance: Decimal = Decimal("0.01"),
     rule: str,
 ) -> CheckResult:
-    """Reconciliation-style check: MER vs QBO must match AND be near-zero.
+    """Line-by-line check (legacy name): matched lines must be near-zero.
+
+    This helper is retained for backward compatibility with earlier tests.
 
     Semantics:
     - Applicable if MER contains at least one matching line.
     - If applicable, QBO must also contain at least one matching line.
-    - Pass if both sides' totals are within tolerance of zero and totals match.
+    - Pass if every matched line on both sides is within tolerance of zero.
+
+    Note: This does NOT sum/aggregate multiple matches.
     """
 
-    mer_matches, mer_total = _collect_matches_by_substring(
+    mer_matches = _collect_line_matches_by_substring(
         items=mer_lines, label_substring=label_substring, tolerance=tolerance
     )
-    qbo_matches, qbo_total = _collect_matches_by_substring(
+    qbo_matches = _collect_line_matches_by_substring(
         items=((i.label, i.amount) for i in qbo_lines),
         label_substring=label_substring,
         tolerance=tolerance,
@@ -279,14 +289,10 @@ def check_reconciled_zero_by_substring(
     applicable = bool(mer_matches)
     qbo_found = bool(qbo_matches)
 
-    passed = (
-        (not applicable)
-        or (
-            qbo_found
-            and is_zero(mer_total, tolerance=tolerance)
-            and is_zero(qbo_total, tolerance=tolerance)
-            and abs(mer_total - qbo_total) <= tolerance
-        )
+    passed = (not applicable) or (
+        qbo_found
+        and all(m["is_zero"] for m in mer_matches)
+        and all(m["is_zero"] for m in qbo_matches)
     )
 
     return CheckResult(
@@ -298,9 +304,6 @@ def check_reconciled_zero_by_substring(
             "tolerance": str(tolerance),
             "applicable": applicable,
             "qbo_found": qbo_found,
-            "mer_total": str(mer_total),
-            "qbo_total": str(qbo_total),
-            "delta": str(mer_total - qbo_total),
             "mer_matches": mer_matches,
             "qbo_matches": qbo_matches,
         },
@@ -324,10 +327,10 @@ def check_zero_on_both_sides_by_substring(
     - Applicable if either side contains at least one matching line.
     """
 
-    mer_matches, mer_total = _collect_matches_by_substring(
+    mer_matches = _collect_line_matches_by_substring(
         items=mer_lines, label_substring=label_substring, tolerance=tolerance
     )
-    qbo_matches, qbo_total = _collect_matches_by_substring(
+    qbo_matches = _collect_line_matches_by_substring(
         items=((i.label, i.amount) for i in qbo_lines),
         label_substring=label_substring,
         tolerance=tolerance,
@@ -338,8 +341,8 @@ def check_zero_on_both_sides_by_substring(
     applicable = mer_found or qbo_found
 
     passed = (not applicable) or (
-        is_zero(mer_total, tolerance=tolerance)
-        and is_zero(qbo_total, tolerance=tolerance)
+        all(m["is_zero"] for m in mer_matches)
+        and all(m["is_zero"] for m in qbo_matches)
     )
 
     return CheckResult(
@@ -352,8 +355,6 @@ def check_zero_on_both_sides_by_substring(
             "applicable": applicable,
             "mer_found": mer_found,
             "qbo_found": qbo_found,
-            "mer_total": str(mer_total),
-            "qbo_total": str(qbo_total),
             "mer_matches": mer_matches,
             "qbo_matches": qbo_matches,
         },

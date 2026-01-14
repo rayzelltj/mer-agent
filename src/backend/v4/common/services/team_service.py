@@ -59,10 +59,14 @@ class TeamService:
                 if field not in json_data:
                     raise ValueError(f"Missing required field: {field}")
 
-            # Generate unique IDs and timestamps
-            unique_team_id = str(uuid.uuid4())
+            # Generate unique doc IDs and timestamps
+            unique_doc_id = str(uuid.uuid4())
             session_id = str(uuid.uuid4())
             current_timestamp = datetime.now(timezone.utc).isoformat()
+
+            # Preserve a provided stable team_id when present (e.g. local single-team setups).
+            # Fall back to a generated UUID to avoid collisions.
+            team_id = (json_data.get("team_id") or "").strip() or str(uuid.uuid4())
 
             # Validate agents array exists and is not empty
             if "agents" not in json_data or not isinstance(json_data["agents"], list):
@@ -98,9 +102,9 @@ class TeamService:
 
             # Create team configuration
             team_config = TeamConfiguration(
-                id=unique_team_id,  # Use generated GUID
+                id=unique_doc_id,  # Document id
                 session_id=session_id,
-                team_id=unique_team_id,  # Use generated GUID
+                team_id=team_id,
                 name=json_data["name"],
                 status=json_data["status"],
                 deployment_name=json_data.get("deployment_name", ""),

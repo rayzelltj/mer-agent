@@ -17,6 +17,7 @@ class Domain(Enum):
     PRODUCT = "product"
     TECH_SUPPORT = "tech_support"
     RETAIL = "retail"
+    FINANCE = "finance"
     GENERAL = "general"
     DATA = "data"
 

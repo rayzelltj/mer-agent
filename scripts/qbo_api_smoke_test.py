@@ -21,9 +21,17 @@ from __future__ import annotations
 import json
 import os
 import time
+import sys
 from typing import Any, Iterable
 
 from dotenv import load_dotenv
+
+# Allow running as: `python scripts/qbo_api_smoke_test.py`
+# by ensuring the repository root (parent of `scripts/`) is on sys.path.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from src.backend.v4.integrations.qbo_client import QBOClient
 
 from src.backend.v4.integrations.qbo_reports import (

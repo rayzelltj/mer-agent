@@ -1,13 +1,34 @@
+import json
 import os
 import sys
-import json
+
 from dotenv import load_dotenv
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 
 load_dotenv()
 if not os.environ.get("SPREADSHEET_ID"):
     load_dotenv(dotenv_path=os.path.abspath(".env.example"), override=False)
+
+print(f"Python executable: {sys.executable}")
+if "conda" in (sys.executable or "").lower() or "anaconda" in (sys.executable or "").lower():
+    print(
+        "NOTE: This looks like a conda Python. If you intended to use the repo venv, run: .venv/bin/python scripts/test_google_access.py",
+        file=sys.stderr,
+    )
+
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+except Exception as e:
+    print("ERROR: Failed importing Google client libraries.", file=sys.stderr)
+    print(f"Import error: {e}", file=sys.stderr)
+    print(
+        "Fix: ensure you're using the repo venv and install deps. Example:\n"
+        "  python -m venv .venv\n"
+        "  source .venv/bin/activate\n"
+        "  pip install -r requirements.txt\n",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
 # Use env vars if available; fall back to sensible defaults for local dev
 SA_PATH = os.environ.get("GOOGLE_SA_FILE") or os.path.expanduser("~/Desktop/service-account.json")
