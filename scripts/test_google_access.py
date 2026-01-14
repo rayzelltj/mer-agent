@@ -91,12 +91,13 @@ for i, r in enumerate(rows[:10]):
         header_row_idx = i
         break
 
+target_col_idx = None
+
 if header_row_idx is None:
     print("No header row found in first 10 rows")
 else:
     header = rows[header_row_idx]
     print(f"Using header row {header_row_idx}: {header}")
-    target_col_idx = None
     search_col_norm = norm(SEARCH_COL_HEADER)
     for j, h in enumerate(header):
         if search_col_norm in norm(h):
@@ -123,7 +124,7 @@ if row_idx is None:
 else:
     print(f"Found row at index {row_idx}: {rows[row_idx]}")
     # Read intersection value if both found
-    if 'target_col_idx' in locals() and target_col_idx is not None:
+    if target_col_idx is not None:
         row = rows[row_idx]
         if target_col_idx < len(row):
             val = row[target_col_idx]

@@ -204,6 +204,7 @@ def _format_generic_tool_bullets(last_tool_results: list[dict], *, bullets: int)
 def _format_mer_review_bullets(result: dict, *, bullets: int) -> str:
     summary = result.get("summary") or {}
     failed = result.get("failed") or []
+    action_items = result.get("action_items") or []
     mer = result.get("mer") or {}
     policies = result.get("policies") or {}
     qbo = result.get("qbo") or {}
@@ -235,6 +236,28 @@ def _format_mer_review_bullets(result: dict, *, bullets: int) -> str:
 
     clarification_preview = ", ".join(clarification_ids) if clarification_ids else "None"
 
+    action_preview: str
+    if isinstance(action_items, list) and action_items:
+        parts: list[str] = []
+        for x in action_items[:3]:
+            if not isinstance(x, dict):
+                continue
+            rid = str(x.get("rule_id") or "").strip()
+            acts = x.get("actions")
+            act_s = ""
+            if isinstance(acts, list):
+                act_s = ",".join([str(a) for a in acts if a])
+            elif isinstance(acts, str):
+                act_s = acts
+            if rid and act_s:
+                parts.append(f"{rid}: {act_s}")
+            elif rid:
+                parts.append(rid)
+        action_preview = "; ".join(parts) if parts else "None"
+    else:
+        action_preview = "None"
+    action_preview = _clip(str(action_preview).replace("\n", " "), 160)
+
     candidates = [
         f"- Period end: {result.get('period_end_date')} (MER month: {mer.get('selected_month_header')})",
         (
@@ -243,6 +266,7 @@ def _format_mer_review_bullets(result: dict, *, bullets: int) -> str:
             f"unimplemented={summary.get('unimplemented')} skipped={summary.get('skipped')}"
         ),
         f"- Failed (preview): {failed_preview}",
+        f"- Action items: {action_preview}",
         f"- Clarification needed: {clarification_preview}",
         (
             f"- QBO extracted items: {qbo.get('balance_sheet_items_extracted')}; "
@@ -297,6 +321,8 @@ def tool_mer_balance_sheet_review(
     from src.backend.v4.integrations.qbo_reports import (
         extract_balance_sheet_items,
         find_first_amount,
+        extract_aged_detail_items_over_threshold,
+        extract_report_total_value,
     )
     from src.backend.v4.use_cases.mer_review_checks import (
         check_bank_balance_matches,
@@ -364,9 +390,64 @@ def tool_mer_balance_sheet_review(
         "balance_sheet_line_items_must_be_zero",
         "mer_line_amount_matches_qbo_line_amount",
         "mer_bank_balance_matches_qbo_bank_balance",
+        "qbo_report_total_matches_balance_sheet_line",
+        "qbo_aging_items_older_than_threshold_require_explanation",
     }
 
     results: list[dict] = []
+
+    def _collect_action_items(rulebook_doc: dict) -> list[dict]:
+        rules = (rulebook_doc.get("rules") or [])
+        if not isinstance(rules, list):
+            return []
+
+        def _walk_for_actions(obj: Any, out: set[str]) -> None:
+            if isinstance(obj, dict):
+                act = obj.get("action")
+                if isinstance(act, str) and act.strip():
+                    out.add(act.strip())
+                for v in obj.values():
+                    _walk_for_actions(v, out)
+            elif isinstance(obj, list):
+                for v in obj:
+                    _walk_for_actions(v, out)
+
+        items: list[dict] = []
+        limit = max(int(os.environ.get("MER_AGENT_ACTION_ITEMS_LIMIT", "10")), 0)
+
+        for r in rules:
+            if not isinstance(r, dict):
+                continue
+            rid = r.get("rule_id")
+            if not rid:
+                continue
+
+            actions: set[str] = set()
+
+            if bool(r.get("manual_attestation_required")):
+                actions.add("manual_attestation_required")
+
+            sop = r.get("sop_expectation")
+            if isinstance(sop, dict) and bool(sop.get("required_step")):
+                actions.add("required_manual_review_step")
+
+            pa = r.get("process_actions")
+            if pa is not None:
+                _walk_for_actions(pa, actions)
+
+            if actions:
+                items.append(
+                    {
+                        "rule_id": str(rid),
+                        "title": str(r.get("title") or ""),
+                        "actions": sorted(actions),
+                    }
+                )
+
+            if limit and len(items) >= limit:
+                break
+
+        return items
 
     def _truncate_evidence(obj: Any) -> Any:
         """Keep tool payloads small to avoid Azure OpenAI TPM 429s."""
@@ -514,6 +595,137 @@ def tool_mer_balance_sheet_review(
             )
             continue
 
+        if eval_type == "qbo_report_total_matches_balance_sheet_line":
+            qbo_reports_required = (
+                (rule.get("evaluation") or {}).get("qbo_reports_required") or []
+            )
+            if not isinstance(qbo_reports_required, list) or not qbo_reports_required:
+                results.append({"rule_id": rule_id, "status": "skipped", "evaluation_type": eval_type})
+                continue
+
+            aging_report = None
+            bs_label_substring = None
+            required_tokens: list[str] = []
+            if "aged_payables_detail" in qbo_reports_required:
+                aging_report = qbo.get_aged_payables_detail(end_date=end_date)
+                bs_label_substring = "accounts payable"
+                required_tokens = ["total", "payable"]
+            elif "aged_receivables_detail" in qbo_reports_required:
+                aging_report = qbo.get_aged_receivables_detail(end_date=end_date)
+                bs_label_substring = "accounts receivable"
+                required_tokens = ["total", "receivable"]
+            else:
+                results.append({"rule_id": rule_id, "status": "skipped", "evaluation_type": eval_type})
+                continue
+
+            total_raw, total_evidence = extract_report_total_value(
+                aging_report or {},
+                total_row_must_contain=required_tokens,
+                prefer_column_titles=["Total"],
+            )
+
+            total_amount = parse_money(total_raw)
+            bs_raw = find_first_amount(qbo_items, str(bs_label_substring or ""))
+            bs_amount = parse_money(bs_raw)
+
+            if total_amount is None or bs_amount is None:
+                results.append(
+                    {
+                        "rule_id": rule_id,
+                        "status": "failed",
+                        "evaluation_type": eval_type,
+                        "evidence": _truncate_evidence(
+                            {
+                                "reason": "Could not parse totals from QBO reports",
+                                "balance_sheet_amount_raw": bs_raw,
+                                "aging_report_total_raw": total_raw,
+                                "aging_report_evidence": total_evidence,
+                            }
+                        ),
+                    }
+                )
+                continue
+
+            delta = total_amount - bs_amount
+            passed = abs(delta) <= amount_match_tolerance
+            results.append(
+                {
+                    "rule_id": rule_id,
+                    "status": "passed" if passed else "failed",
+                    "evaluation_type": eval_type,
+                    "evidence": _truncate_evidence(
+                        {
+                            "balance_sheet_label_substring": bs_label_substring,
+                            "balance_sheet_amount_raw": bs_raw,
+                            "balance_sheet_amount": str(bs_amount),
+                            "aging_report_total_raw": total_raw,
+                            "aging_report_total": str(total_amount),
+                            "tolerance": str(amount_match_tolerance),
+                            "delta": str(delta),
+                            "aging_report_evidence": total_evidence,
+                        }
+                    ),
+                }
+            )
+            continue
+
+        if eval_type == "qbo_aging_items_older_than_threshold_require_explanation":
+            params = rule.get("parameters") or {}
+            max_age_days = params.get("max_age_days")
+            if max_age_days is None:
+                results.append({"rule_id": rule_id, "status": "skipped", "evaluation_type": eval_type})
+                continue
+            try:
+                max_age_days_int = int(max_age_days)
+            except Exception:
+                results.append({"rule_id": rule_id, "status": "skipped", "evaluation_type": eval_type})
+                continue
+
+            limit = max(int(os.environ.get("MER_AGENT_AGING_ITEMS_LIMIT", "100")), 0)
+            ap_report = qbo.get_aged_payables_detail(end_date=end_date)
+            ar_report = qbo.get_aged_receivables_detail(end_date=end_date)
+
+            ap = extract_aged_detail_items_over_threshold(
+                ap_report or {}, max_age_days=max_age_days_int, limit=limit
+            )
+            ar = extract_aged_detail_items_over_threshold(
+                ar_report or {}, max_age_days=max_age_days_int, limit=limit
+            )
+
+            ap_items = ap.get("items") or []
+            ar_items = ar.get("items") or []
+            has_findings = bool(ap_items) or bool(ar_items)
+
+            results.append(
+                {
+                    "rule_id": rule_id,
+                    "status": "failed" if has_findings else "passed",
+                    "evaluation_type": eval_type,
+                    "evidence": _truncate_evidence(
+                        {
+                            "period_end_date": end_date,
+                            "max_age_days": max_age_days_int,
+                            "requires_explanation": True,
+                            "explanation_mode": "manual",
+                            "ap": {
+                                "count": len(ap_items),
+                                "total_over_threshold": ap.get("total_over_threshold"),
+                                "items": ap_items,
+                                "evidence": ap.get("evidence"),
+                            },
+                            "ar": {
+                                "count": len(ar_items),
+                                "total_over_threshold": ar.get("total_over_threshold"),
+                                "items": ar_items,
+                                "evidence": ar.get("evidence"),
+                            },
+                            "action": "Provide an explanation/comment/link for each > threshold open AP/AR item",
+                        }
+                    ),
+                }
+            )
+            continue
+
     # Compact the payload: keep summary + failed evidence, omit huge unimplemented list.
     passed = sum(1 for r in results if r.get("status") == "passed")
     failed = sum(1 for r in results if r.get("status") == "failed")
@@ -556,6 +768,7 @@ def tool_mer_balance_sheet_review(
             "total_considered": len(results),
         },
         "failed": failed_results,
+        "action_items": _collect_action_items(rulebook),
     }
 
 
@@ -917,10 +1130,14 @@ async def run_agent(prompt: str, max_steps: int) -> str:
             try:
                 _log("calling Azure OpenAI...")
                 print(f"[llm] request (attempt {attempt}/{max_attempts})", file=sys.stderr)
+                # The OpenAI SDK provides precise type hints for messages/tools; in this script
+                # we build them dynamically as plain dicts.
+                messages_any: Any = messages
+                tools_any: Any = tools
                 return client.chat.completions.create(
                     model=deployment,
-                    messages=messages,
-                    tools=tools,
+                    messages=messages_any,
+                    tools=tools_any,
                     tool_choice="auto",
                     temperature=0.2,
                     max_tokens=max_tokens,
@@ -1013,7 +1230,7 @@ def main() -> int:
     try:
         out = asyncio.run(run_agent(args.prompt, max_steps=args.max_steps))
     except Exception as e:
-        print(f"ERROR: {e}", file=os.sys.stderr)
+        print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
     print(out)

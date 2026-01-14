@@ -81,6 +81,8 @@ def main() -> int:
         "balance_sheet_line_items_must_be_zero",
         "mer_line_amount_matches_qbo_line_amount",
         "mer_bank_balance_matches_qbo_bank_balance",
+        "qbo_report_total_matches_balance_sheet_line",
+        "qbo_aging_items_older_than_threshold_require_explanation",
     }
 
     eval_types = [

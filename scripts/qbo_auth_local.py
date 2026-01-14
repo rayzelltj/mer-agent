@@ -10,8 +10,17 @@ What this does:
 Prereqs (env vars):
 - QBO_CLIENT_ID
 - QBO_CLIENT_SECRET
-- QBO_REDIRECT_URI   (must exactly match what's configured in Intuit Developer)
-- QBO_ENVIRONMENT    (sandbox | production)  [default: sandbox]
+- QBO_REDIRECT_URI         (must exactly match what's configured in Intuit Developer)
+- QBO_ENVIRONMENT          (sandbox | production)  [default: sandbox]
+
+Optional (recommended for production local testing):
+- QBO_LOCAL_REDIRECT_URI   Local listener URI for the callback server.
+    Use this if QBO_REDIRECT_URI is a public HTTPS URL (e.g., via ngrok) but you
+    still want this script to listen on localhost.
+
+    Example (production-friendly):
+        QBO_REDIRECT_URI=https://<your-subdomain>.ngrok-free.app/qbo/callback
+        QBO_LOCAL_REDIRECT_URI=http://localhost:8040/qbo/callback
 
 Run:
   python scripts/qbo_auth_local.py
@@ -61,14 +70,19 @@ def main() -> None:
     client_id = _require_env("QBO_CLIENT_ID")
     client_secret = _require_env("QBO_CLIENT_SECRET")
     redirect_uri = _require_env("QBO_REDIRECT_URI")
+    local_redirect_uri = os.environ.get("QBO_LOCAL_REDIRECT_URI") or redirect_uri
     environment = os.environ.get("QBO_ENVIRONMENT", "sandbox")
 
     parsed = urlparse(redirect_uri)
     if parsed.scheme not in {"http", "https"}:
         raise SystemExit("QBO_REDIRECT_URI must start with http:// or https://")
-    if not parsed.hostname or not parsed.port:
+
+    local_parsed = urlparse(local_redirect_uri)
+    if local_parsed.scheme not in {"http", "https"}:
+        raise SystemExit("QBO_LOCAL_REDIRECT_URI must start with http:// or https://")
+    if not local_parsed.hostname or not local_parsed.port:
         raise SystemExit(
-            "QBO_REDIRECT_URI must include hostname and port, e.g. http://localhost:8040/qbo/callback"
+            "QBO_LOCAL_REDIRECT_URI must include hostname and port, e.g. http://localhost:8040/qbo/callback"
         )
 
     state = _CallbackState()
@@ -76,7 +90,7 @@ def main() -> None:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
             # Only accept the configured callback path
-            if urlparse(self.path).path != parsed.path:
+            if urlparse(self.path).path != local_parsed.path:
                 self.send_response(404)
                 self.end_headers()
                 self.wfile.write(b"Not found")
@@ -99,7 +113,7 @@ def main() -> None:
             # Quiet default HTTP server logging
             return
 
-    server = HTTPServer((parsed.hostname, parsed.port), Handler)
+    server = HTTPServer((local_parsed.hostname, local_parsed.port), Handler)
 
     def run_server():
         server.serve_forever(poll_interval=0.1)
@@ -128,6 +142,9 @@ def main() -> None:
 
     print("\n2) After you click 'Connect', you will be redirected back to:")
     print(f"   {redirect_uri}")
+    if local_redirect_uri != redirect_uri:
+        print("   (This script is listening locally on:")
+        print(f"    {local_redirect_uri} )")
     print("   Waiting for callback...")
 
     timeout_s = int(os.environ.get("QBO_AUTH_TIMEOUT_SECONDS", "180"))

@@ -186,6 +186,27 @@ rules:
         - delta
         - period_end_date
 
+  - rule_id: BS-PETTY-CASH-FORMAL-RECONCILE-PRESENT
+    title: "Petty cash has a formal reconciliation artifact"
+    what_are_we_testing: "When the client provides a petty cash balance to reconcile to (ideally monthly), a formal reconciliation artifact exists (workpaper/tab/link), not just an amount match."
+    source: "Reconciliation spreadsheet / workpapers (Drive/Sheets) + client-provided petty cash balance evidence"
+    matching_against: "Reconciliation artifact present (link or tab)"
+    qbo_only: false
+    requires_external_sources:
+      - reconciliation_spreadsheet
+      - client_maintenance_kyc
+    manual_attestation_required: true
+    evaluation:
+      type: support_link_presence_check
+    outputs:
+      evidence_fields:
+        - period_end_date
+        - account_name
+        - evidence_links
+        - reconciliation_artifact_present
+    limitations:
+      - "Automation may not be able to prove a client-provided petty cash balance exists; treat missing evidence as Needs Human Review unless a configured source provides it."
+
   - rule_id: BS-BANK-AND-CC-INVENTORY-COVERAGE
     title: "All bank/credit card accounts from maintenance sheet are included"
     what_are_we_testing: "All accounts in the client's 'List of bank accounts and credit cards' inventory exist in QBO and are represented in the MER review package."
@@ -292,12 +313,15 @@ rules:
 
   - rule_id: BS-UNCLEARED-ITEMS-SUGGEST-DUPLICATE-SCAN
     title: "Uncleared items cross-checked vs AP/AR for duplicates"
-    what_are_we_testing: "Reviewer guidance: compare AP/AR listings to uncleared bank/CC transactions to identify possible duplicates (e.g., cash-coded duplicates)."
+    what_are_we_testing: "SOP-expected reviewer step (non-deterministic): compare AP/AR listings to uncleared bank/CC transactions to identify possible duplicates (e.g., cash-coded duplicates)."
     source: "QBO transactions + QBO AP/AR reports + reconciliation spreadsheet"
     matching_against: "Potential duplicate signals"
     qbo_only: false
     requires_external_sources:
       - reconciliation_spreadsheet
+    sop_expectation:
+      required_step: true
+      determinism: "non_deterministic_reviewer_guidance"
     evaluation:
       type: heuristic_duplicate_detection
     outputs:
@@ -305,7 +329,7 @@ rules:
         - suspected_duplicate_pair
         - rationale
     limitations:
-      - "This is inherently heuristic and should produce 'warn' findings for human review, not deterministic failures."
+      - "This is inherently heuristic and should produce 'warn' / 'needs_human_review' findings, not deterministic failures."
 
   - rule_id: BS-PLOOTO-CLEARING-ZERO
     title: "Plooto clearing account is zero"
@@ -350,6 +374,26 @@ rules:
     evaluation:
       type: requires_external_statement_reconciliation
 
+  - rule_id: BS-FX-DELEGATE-ACCESS-ATTESTED
+    title: "Wise/OFX delegate access confirmed"
+    what_are_we_testing: "SOP expectation: Enkel should have delegate access to Wise/OFX (or equivalent FX platforms) used by the client. If automation cannot verify access existence, require manual attestation and record where access was confirmed."
+    source: "Wise/OFX (or platform) access settings + internal access records"
+    matching_against: "Delegate access confirmed"
+    qbo_only: false
+    requires_external_sources:
+      - client_maintenance_kyc
+    manual_attestation_required: true
+    evaluation:
+      type: needs_human_judgment
+    outputs:
+      evidence_fields:
+        - period_end_date
+        - platform
+        - delegate_access_confirmed
+        - evidence_links
+    limitations:
+      - "Access existence is typically not API-verifiable in this workflow; treat as a manual control/attestation step."
+
   - rule_id: BS-AP-SUBLEDGER-RECONCILES
     title: "Aged Payables Detail reconciles to Balance Sheet"
     what_are_we_testing: "Aged Payables Detail total reconciles to the Accounts Payable balance sheet account at period end."
@@ -386,6 +430,9 @@ rules:
     source: "QBO Aged Payables/Receivables reports + MER notes/comments"
     matching_against: "Age > 60 days"
     qbo_only: true
+    sop_expectation:
+      required_step: true
+      determinism: deterministic_detection_requires_manual_explanation
     parameters:
       max_age_days: 60
       explanation_policy_ref: "policies.explanation_definition"
@@ -676,6 +723,10 @@ rules:
     qbo_only: false
     requires_external_sources:
       - client_maintenance_kyc
+    process_actions:
+      on_missing_threshold_documentation:
+        action: "raise_obp_ticket"
+        reason: "Client acceptable clearing range is required in KYC/SOP; create OBP ticket when missing so the range can be captured/confirmed."
     evaluation:
       type: balance_within_configured_range
 

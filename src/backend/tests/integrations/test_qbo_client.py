@@ -139,3 +139,77 @@ def test_get_accounts_uses_query_api(monkeypatch, tmp_path) -> None:
     assert "query" in seen.params
     assert "select * from Account" in seen.params["query"]
     assert "MAXRESULTS 123" in seen.params["query"]
+
+
+def test_get_aged_payables_detail_calls_report_endpoint(monkeypatch, tmp_path) -> None:
+    tokens_path = tmp_path / "tokens.json"
+    tokens_path.write_text(
+        json.dumps(
+            {
+                "environment": "sandbox",
+                "realm_id": "123",
+                "access_token": "ok",
+                "refresh_token": "refresh",
+                "id_token": None,
+            }
+        )
+    )
+
+    client = QBOClient(
+        client_id="cid",
+        client_secret="secret",
+        redirect_uri="http://localhost",
+        environment="sandbox",
+        tokens_path=str(tokens_path),
+    )
+
+    seen = SimpleNamespace(url=None, params=None)
+
+    def fake_request(method, url, headers=None, params=None, timeout=None):
+        seen.url = url
+        seen.params = params
+        return _FakeResp(200, {"Rows": {"Row": []}})
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client.get_aged_payables_detail(end_date="2025-11-30")
+    assert seen.url is not None and seen.url.endswith("/v3/company/123/reports/AgedPayablesDetail")
+    assert seen.params == {"end_date": "2025-11-30"}
+
+
+def test_get_aged_receivables_detail_calls_report_endpoint(monkeypatch, tmp_path) -> None:
+    tokens_path = tmp_path / "tokens.json"
+    tokens_path.write_text(
+        json.dumps(
+            {
+                "environment": "sandbox",
+                "realm_id": "123",
+                "access_token": "ok",
+                "refresh_token": "refresh",
+                "id_token": None,
+            }
+        )
+    )
+
+    client = QBOClient(
+        client_id="cid",
+        client_secret="secret",
+        redirect_uri="http://localhost",
+        environment="sandbox",
+        tokens_path=str(tokens_path),
+    )
+
+    seen = SimpleNamespace(url=None, params=None)
+
+    def fake_request(method, url, headers=None, params=None, timeout=None):
+        seen.url = url
+        seen.params = params
+        return _FakeResp(200, {"Rows": {"Row": []}})
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client.get_aged_receivables_detail(end_date="2025-11-30")
+    assert seen.url is not None and seen.url.endswith(
+        "/v3/company/123/reports/AgedReceivablesDetail"
+    )
+    assert seen.params == {"end_date": "2025-11-30"}

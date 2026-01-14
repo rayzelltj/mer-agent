@@ -140,6 +140,11 @@ class QBOClient:
         )
         auth.refresh(refresh_token=auth.refresh_token)
 
+        if not auth.access_token or not auth.refresh_token:
+            raise RuntimeError(
+                "QBO token refresh failed (missing refreshed access_token/refresh_token)"
+            )
+
         updated = QBOAuthTokens(
             environment=tokens.environment,
             realm_id=auth.realm_id or tokens.realm_id,
@@ -229,6 +234,54 @@ class QBOClient:
                     params=params,
                 )
             raise
+
+    def _get_report(
+        self,
+        *,
+        report_name: str,
+        params: dict[str, str],
+    ) -> dict[str, Any]:
+        """Fetch a QBO report by name.
+
+        Example report_name values:
+        - BalanceSheet
+        - AgedPayablesDetail
+        - AgedReceivablesDetail
+        """
+
+        tokens = self.load_tokens()
+        base = self._base_url(tokens.environment)
+        url = f"{base}/v3/company/{tokens.realm_id}/reports/{report_name}"
+
+        try:
+            return self._request_json(
+                "GET",
+                url,
+                bearer_token=tokens.access_token,
+                params=params,
+            )
+        except RuntimeError as e:
+            if "401" in str(e) or "invalid_token" in str(e).lower():
+                tokens = self.refresh_tokens(tokens)
+                return self._request_json(
+                    "GET",
+                    url,
+                    bearer_token=tokens.access_token,
+                    params=params,
+                )
+            raise
+
+    def get_aged_payables_detail(self, *, end_date: str) -> dict[str, Any]:
+        return self._get_report(
+            report_name="AgedPayablesDetail",
+            params={"end_date": end_date},
+        )
+
+    def get_aged_receivables_detail(self, *, end_date: str) -> dict[str, Any]:
+        return self._get_report(
+            report_name="AgedReceivablesDetail",
+            params={"end_date": end_date},
+        )
 
     def query(
         self,
