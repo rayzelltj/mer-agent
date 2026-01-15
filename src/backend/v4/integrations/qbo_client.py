@@ -272,16 +272,75 @@ class QBOClient:
             raise
 
     def get_aged_payables_detail(self, *, end_date: str) -> dict[str, Any]:
-        return self._get_report(
-            report_name="AgedPayablesDetail",
-            params={"end_date": end_date},
-        )
+        # Note: Some QBO tenants/apps deny the *Detail/*Summary report names (5020 ReportName),
+        # but allow the shorter canonical report name.
+        # Also: for aging reports, QBO expects `report_date` for an "as of" run date.
+        try:
+            return self._get_report(
+                report_name="AgedPayablesDetail",
+                params={"report_date": end_date},
+            )
+        except RuntimeError:
+            return self._get_report(
+                report_name="AgedPayables",
+                params={"report_date": end_date},
+            )
 
     def get_aged_receivables_detail(self, *, end_date: str) -> dict[str, Any]:
-        return self._get_report(
-            report_name="AgedReceivablesDetail",
-            params={"end_date": end_date},
-        )
+        try:
+            return self._get_report(
+                report_name="AgedReceivablesDetail",
+                params={"report_date": end_date},
+            )
+        except RuntimeError:
+            return self._get_report(
+                report_name="AgedReceivables",
+                params={"report_date": end_date},
+            )
+
+    def get_aged_payables_total(
+        self,
+        *,
+        end_date: str,
+    ) -> dict[str, Any]:
+        """Fetch an AP aging report suitable for extracting a total.
+
+        Prefer the canonical AgedPayables (works in more tenants), with a fallback to
+        AgedPayablesSummary when available.
+        """
+
+        try:
+            return self._get_report(
+                report_name="AgedPayables",
+                params={"report_date": end_date},
+            )
+        except RuntimeError:
+            return self._get_report(
+                report_name="AgedPayablesSummary",
+                params={"report_date": end_date},
+            )
+
+    def get_aged_receivables_total(
+        self,
+        *,
+        end_date: str,
+    ) -> dict[str, Any]:
+        """Fetch an AR aging report suitable for extracting a total.
+
+        Prefer the canonical AgedReceivables (works in more tenants), with a fallback to
+        AgedReceivablesSummary when available.
+        """
+
+        try:
+            return self._get_report(
+                report_name="AgedReceivables",
+                params={"report_date": end_date},
+            )
+        except RuntimeError:
+            return self._get_report(
+                report_name="AgedReceivablesSummary",
+                params={"report_date": end_date},
+            )
 
     def query(
         self,

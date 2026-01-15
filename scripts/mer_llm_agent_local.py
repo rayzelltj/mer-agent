@@ -396,6 +396,17 @@ def tool_mer_balance_sheet_review(
 
     results: list[dict] = []
 
+    def _qbo_report_permission_denied(err: Exception) -> bool:
+        # QBO returns code 5020 with element ReportName for some reports when the app/user
+        # lacks entitlement/permission. We treat this as a "skipped" (blocked) rule so
+        # the remainder of the review can still run.
+        msg = str(err)
+        return (
+            "Permission Denied" in msg
+            and ("\"code\":\"5020\"" in msg or "'code':'5020'" in msg or "code\":\"5020" in msg)
+            and "ReportName" in msg
+        )
+
     def _collect_action_items(rulebook_doc: dict) -> list[dict]:
         rules = (rulebook_doc.get("rules") or [])
         if not isinstance(rules, list):
@@ -607,13 +618,53 @@ def tool_mer_balance_sheet_review(
             bs_label_substring = None
             required_tokens: list[str] = []
             if "aged_payables_detail" in qbo_reports_required:
-                aging_report = qbo.get_aged_payables_detail(end_date=end_date)
+                try:
+                    # In some tenants, AgedPayablesDetail is denied but AgedPayables works.
+                    aging_report = qbo.get_aged_payables_total(end_date=end_date)
+                except Exception as e:
+                    if _qbo_report_permission_denied(e):
+                        results.append(
+                            {
+                                "rule_id": rule_id,
+                                "status": "skipped",
+                                "evaluation_type": eval_type,
+                                "evidence": _truncate_evidence(
+                                    {
+                                        "reason": "blocked_by_qbo_report_permission",
+                                        "report": "AgedPayables*",
+                                        "error": str(e),
+                                    }
+                                ),
+                            }
+                        )
+                        continue
+                    raise
                 bs_label_substring = "accounts payable"
-                required_tokens = ["total", "payable"]
+                # AgedPayables often uses a row label literally called "TOTAL".
+                required_tokens = ["total"]
             elif "aged_receivables_detail" in qbo_reports_required:
-                aging_report = qbo.get_aged_receivables_detail(end_date=end_date)
+                try:
+                    aging_report = qbo.get_aged_receivables_total(end_date=end_date)
+                except Exception as e:
+                    if _qbo_report_permission_denied(e):
+                        results.append(
+                            {
+                                "rule_id": rule_id,
+                                "status": "skipped",
+                                "evaluation_type": eval_type,
+                                "evidence": _truncate_evidence(
+                                    {
+                                        "reason": "blocked_by_qbo_report_permission",
+                                        "report": "AgedReceivables*",
+                                        "error": str(e),
+                                    }
+                                ),
+                            }
+                        )
+                        continue
+                    raise
                 bs_label_substring = "accounts receivable"
-                required_tokens = ["total", "receivable"]
+                required_tokens = ["total"]
             else:
                 results.append({"rule_id": rule_id, "status": "skipped", "evaluation_type": eval_type})
                 continue
@@ -682,8 +733,28 @@ def tool_mer_balance_sheet_review(
                 continue
 
             limit = max(int(os.environ.get("MER_AGENT_AGING_ITEMS_LIMIT", "100")), 0)
-            ap_report = qbo.get_aged_payables_detail(end_date=end_date)
-            ar_report = qbo.get_aged_receivables_detail(end_date=end_date)
+
+            try:
+                ap_report = qbo.get_aged_payables_detail(end_date=end_date)
+                ar_report = qbo.get_aged_receivables_detail(end_date=end_date)
+            except Exception as e:
+                if _qbo_report_permission_denied(e):
+                    results.append(
+                        {
+                            "rule_id": rule_id,
+                            "status": "skipped",
+                            "evaluation_type": eval_type,
+                            "evidence": _truncate_evidence(
+                                {
+                                    "reason": "blocked_by_qbo_report_permission",
+                                    "reports": ["AgedPayables*", "AgedReceivables*"],
+                                    "error": str(e),
+                                }
+                            ),
+                        }
+                    )
+                    continue
+                raise
 
             ap = extract_aged_detail_items_over_threshold(
                 ap_report or {}, max_age_days=max_age_days_int, limit=limit
@@ -742,6 +813,29 @@ def tool_mer_balance_sheet_review(
         if r.get("status") == "failed"
     ][: max(max_failed, 0)]
 
+    max_skipped = int(os.environ.get("MER_AGENT_SKIPPED_RULES_LIMIT", "10"))
+    skipped_results = [
+        {
+            "rule_id": r.get("rule_id"),
+            "evaluation_type": r.get("evaluation_type"),
+            "evidence": r.get("evidence"),
+        }
+        for r in results
+        if r.get("status") == "skipped"
+    ][: max(max_skipped, 0)]
+
+    max_implemented = int(os.environ.get("MER_AGENT_IMPLEMENTED_RULES_LIMIT", "50"))
+    implemented_results = [
+        {
+            "rule_id": r.get("rule_id"),
+            "status": r.get("status"),
+            "evaluation_type": r.get("evaluation_type"),
+            "evidence": r.get("evidence"),
+        }
+        for r in results
+        if r.get("evaluation_type") in implemented_types and r.get("status") != "unimplemented"
+    ][: max(max_implemented, 0)]
+
     return {
         "period_end_date": end_date,
         "mer": {
@@ -768,6 +862,8 @@ def tool_mer_balance_sheet_review(
             "total_considered": len(results),
         },
         "failed": failed_results,
+        "skipped": skipped_results,
+        "implemented": implemented_results,
         "action_items": _collect_action_items(rulebook),
     }
 
@@ -967,7 +1063,16 @@ async def run_agent(prompt: str, max_steps: int) -> str:
         if not end_date:
             return "- Missing end_date (YYYY-MM-DD)"
         result = tool_mer_balance_sheet_review(end_date=end_date)
-        return _format_mer_review_bullets(result, bullets=bullet_count)
+        want_full_json = os.environ.get("MER_AGENT_PRINT_TOOL_JSON", "0") == "1"
+        want_full_json = want_full_json or ("full tool result json" in prompt.lower())
+        want_full_json = want_full_json or ("print the full tool result" in prompt.lower())
+
+        bullets = _format_mer_review_bullets(result, bullets=bullet_count)
+        if not want_full_json:
+            return bullets
+
+        payload = json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True)
+        return payload + "\n\n" + bullets
 
     endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
     deployment = os.environ.get("MER_AGENT_LLM_DEPLOYMENT") or os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME")

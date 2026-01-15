@@ -5,7 +5,7 @@ import uuid
 from datetime import date as _date
 from decimal import Decimal
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import v4.models.messages as messages
 from v4.models.messages import WebsocketMessageType
@@ -66,6 +66,21 @@ from src.backend.v4.use_cases.mer_review_checks import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _qbo_report_permission_denied(err: Exception) -> bool:
+    """Detect QBO Reports API permission denial for a report name.
+
+    QBO commonly returns HTTP 400 with ValidationFault code 5020 and element
+    ReportName when the app/user lacks entitlement for a specific report.
+    """
+
+    msg = str(err)
+    return (
+        "Permission Denied" in msg
+        and "ReportName" in msg
+        and "5020" in msg
+    )
 
 app_v4 = APIRouter(
     prefix="/api/v4",
@@ -413,13 +428,51 @@ async def mer_review_balance_sheet(body: MERBalanceSheetReviewRequest):
             required_tokens: list[str] = []
 
             if "aged_payables_detail" in qbo_reports_required:
-                aging_report = qbo.get_aged_payables_detail(end_date=body.end_date)
+                try:
+                    # Prefer the canonical report name (works in more tenants).
+                    aging_report = qbo.get_aged_payables_total(end_date=body.end_date)
+                except Exception as e:
+                    if _qbo_report_permission_denied(e):
+                        results.append(
+                            {
+                                "rule_id": rule_id,
+                                "status": "skipped",
+                                "evaluation_type": eval_type,
+                                "details": {
+                                    "rule": rule.get("title"),
+                                    "reason": "blocked_by_qbo_report_permission",
+                                    "report": "AgedPayables*",
+                                    "error": str(e),
+                                },
+                            }
+                        )
+                        continue
+                    raise
                 bs_label_substring = "accounts payable"
-                required_tokens = ["total", "payable"]
+                # In AgedPayables payloads, the row label is often literally "TOTAL".
+                required_tokens = ["total"]
             elif "aged_receivables_detail" in qbo_reports_required:
-                aging_report = qbo.get_aged_receivables_detail(end_date=body.end_date)
+                try:
+                    aging_report = qbo.get_aged_receivables_total(end_date=body.end_date)
+                except Exception as e:
+                    if _qbo_report_permission_denied(e):
+                        results.append(
+                            {
+                                "rule_id": rule_id,
+                                "status": "skipped",
+                                "evaluation_type": eval_type,
+                                "details": {
+                                    "rule": rule.get("title"),
+                                    "reason": "blocked_by_qbo_report_permission",
+                                    "report": "AgedReceivables*",
+                                    "error": str(e),
+                                },
+                            }
+                        )
+                        continue
+                    raise
                 bs_label_substring = "accounts receivable"
-                required_tokens = ["total", "receivable"]
+                required_tokens = ["total"]
             else:
                 results.append(
                     {
@@ -501,8 +554,26 @@ async def mer_review_balance_sheet(body: MERBalanceSheetReviewRequest):
 
             limit = max(int(os.environ.get("MER_AGENT_AGING_ITEMS_LIMIT", "100")), 0)
 
-            ap_report = qbo.get_aged_payables_detail(end_date=body.end_date)
-            ar_report = qbo.get_aged_receivables_detail(end_date=body.end_date)
+            try:
+                ap_report = qbo.get_aged_payables_detail(end_date=body.end_date)
+                ar_report = qbo.get_aged_receivables_detail(end_date=body.end_date)
+            except Exception as e:
+                if _qbo_report_permission_denied(e):
+                    results.append(
+                        {
+                            "rule_id": rule_id,
+                            "status": "skipped",
+                            "evaluation_type": eval_type,
+                            "details": {
+                                "rule": rule.get("title"),
+                                "reason": "blocked_by_qbo_report_permission",
+                                "reports": ["AgedPayables*", "AgedReceivables*"],
+                                "error": str(e),
+                            },
+                        }
+                    )
+                    continue
+                raise
 
             ap = extract_aged_detail_items_over_threshold(
                 ap_report or {}, max_age_days=max_age_days_int, limit=limit
