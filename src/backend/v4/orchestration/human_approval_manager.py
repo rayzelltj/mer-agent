@@ -19,6 +19,7 @@ from agent_framework._workflows._magentic import (
 
 from v4.config.settings import connection_config, orchestration_config
 from v4.models.models import MPlan
+from v4.models.models import PlanStatus
 from v4.orchestration.helper.plan_to_mplan_converter import PlanToMPlanConverter
 
 logger = logging.getLogger(__name__)
@@ -106,7 +107,7 @@ DO NOT EVER OFFER TO HELP FURTHER IN THE FINAL ANSWER! Just provide the final an
 
         approval_message = messages.PlanApprovalRequest(
             plan=self.magentic_plan,
-            status="PENDING_APPROVAL",
+            status=PlanStatus.PENDING_APPROVAL,
             context=(
                 {
                     "task": task_text,
@@ -209,7 +210,7 @@ DO NOT EVER OFFER TO HELP FURTHER IN THE FINAL ANSWER! Just provide the final an
 
         if not m_plan_id:
             logger.error("No plan ID provided for approval")
-            return messages.PlanApprovalResponse(approved=False, m_plan_id=m_plan_id)
+            return messages.PlanApprovalResponse(approved=False, m_plan_id="")
 
         orchestration_config.set_approval_pending(m_plan_id)
 
@@ -296,9 +297,20 @@ DO NOT EVER OFFER TO HELP FURTHER IN THE FINAL ANSWER! Just provide the final an
 
         task_text = getattr(magentic_context.task, "text", str(magentic_context.task))
 
+        plan_text = (
+            getattr(ledger.plan, "text", None)
+            or getattr(ledger.plan, "content", None)
+            or ""
+        )
+        facts_text = (
+            getattr(ledger.facts, "text", None)
+            or getattr(ledger.facts, "content", None)
+            or ""
+        )
+
         return_plan: MPlan = PlanToMPlanConverter.convert(
-            plan_text=getattr(ledger.plan, "text", ""),
-            facts=getattr(ledger.facts, "text", ""),
+            plan_text=str(plan_text),
+            facts=str(facts_text),
             team=list(magentic_context.participant_descriptions.keys()),
             task=task_text,
         )

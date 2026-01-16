@@ -2,15 +2,19 @@
 
 import logging
 import uuid
-from common.config.app_config import config
+from typing import TYPE_CHECKING, Any
 
-from common.database.database_base import DatabaseBase
-from common.models.messages_af import TeamConfiguration
-from v4.common.services.team_service import TeamService
-from v4.config.agent_registry import agent_registry
-from v4.magentic_agents.foundry_agent import (
-    FoundryAgentTemplate,
-)  # formerly v4.magentic_agents.foundry_agent
+from src.backend.common.config.app_config import config
+
+from src.backend.common.database.database_base import DatabaseBase
+from src.backend.common.models.messages_af import TeamConfiguration
+from src.backend.v4.common.services.team_service import TeamService
+from src.backend.v4.config.agent_registry import agent_registry
+
+if TYPE_CHECKING:  # pragma: no cover
+    from src.backend.v4.magentic_agents.foundry_agent import FoundryAgentTemplate
+else:
+    FoundryAgentTemplate = Any
 
 logging.basicConfig(level=logging.INFO)
 
@@ -59,6 +63,8 @@ async def create_RAI_agent(
     team: TeamConfiguration, memory_store: DatabaseBase
 ) -> FoundryAgentTemplate:
     """Create and initialize a FoundryAgentTemplate for Responsible AI (RAI) checks."""
+    from src.backend.v4.magentic_agents.foundry_agent import FoundryAgentTemplate as _FoundryAgentTemplate
+
     agent_name = "RAIAgent"
     agent_description = "A comprehensive research assistant for integration testing"
     agent_instructions = (
@@ -92,7 +98,7 @@ async def create_RAI_agent(
     team.team_id = "rai_team"  # Use a fixed team ID for RAI agent
     team.name = "RAI Team"
     team.description = "Team responsible for Responsible AI checks"
-    agent = FoundryAgentTemplate(
+    agent = _FoundryAgentTemplate(
         agent_name=agent_name,
         agent_description=agent_description,
         agent_instructions=agent_instructions,

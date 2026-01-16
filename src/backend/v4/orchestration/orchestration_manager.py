@@ -6,7 +6,14 @@ import uuid
 from typing import List, Optional
 
 # agent_framework imports
-from agent_framework_azure_ai import AzureAIAgentClient
+_AZURE_AI_IMPORT_ERROR: Exception | None = None
+try:
+    from agent_framework_azure_ai import AzureAIAgentClient
+except Exception as exc:  # pragma: no cover
+    # Keep module importable for unit tests and local tooling that don't require
+    # Azure AI orchestration to be initialized.
+    AzureAIAgentClient = None  # type: ignore[assignment]
+    _AZURE_AI_IMPORT_ERROR = exc
 
 # NOTE: agent_framework is a prerelease library and its exported symbols can vary
 # between versions. We load attributes via getattr to keep the backend importable
@@ -80,6 +87,12 @@ class OrchestrationManager:
         """
         if not user_id:
             raise ValueError("user_id is required to initialize orchestration")
+
+        if AzureAIAgentClient is None:  # pragma: no cover
+            raise RuntimeError(
+                "AzureAIAgentClient is unavailable. "
+                f"Import error: {_AZURE_AI_IMPORT_ERROR!r}"
+            )
 
         # Get credential from config (same as old version)
         credential = config.get_azure_credential(client_id=config.AZURE_CLIENT_ID)

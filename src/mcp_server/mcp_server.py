@@ -4,16 +4,22 @@ MACAE MCP Server - FastMCP server with organized tools and services.
 
 import argparse
 import logging
-###
+import os
+import sys
 
-from config.settings import config
-from core.factory import MCPToolFactory
-from fastmcp.server.auth.providers.jwt import JWTVerifier
-from services.hr_service import HRService
-from services.mer_review_service import MERReviewService
-from services.marketing_service import MarketingService
-from services.product_service import ProductService
-from services.tech_support_service import TechSupportService
+# Allow running this file directly (or via tools like `fastmcp run`) by ensuring
+# the repository root is on sys.path so `import src...` works.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from src.mcp_server.config.settings import config
+from src.mcp_server.core.factory import MCPToolFactory
+from src.mcp_server.services.hr_service import HRService
+from src.mcp_server.services.mer_review_service import MERReviewService
+from src.mcp_server.services.marketing_service import MarketingService
+from src.mcp_server.services.product_service import ProductService
+from src.mcp_server.services.tech_support_service import TechSupportService
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -34,6 +40,8 @@ factory.register_service(MERReviewService())
 def create_fastmcp_server():
     """Create and configure FastMCP server."""
     try:
+        from fastmcp.server.auth.providers.jwt import JWTVerifier
+
         # Create authentication provider if enabled
         auth = None
         if config.enable_auth:

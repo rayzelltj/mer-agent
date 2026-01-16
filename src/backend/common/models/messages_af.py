@@ -93,6 +93,7 @@ class AgentMessage(BaseDataModel):
     """Base class for messages sent between agents."""
     data_type: Literal[DataType.agent_message] = DataType.agent_message
     plan_id: str
+    user_id: Optional[str] = None
     content: str
     source: str
     step_id: Optional[str] = None
@@ -127,7 +128,7 @@ class CurrentTeamAgent(BaseDataModel):
 class Plan(BaseDataModel):
     """Represents a plan containing multiple steps."""
     data_type: Literal[DataType.plan] = DataType.plan
-    plan_id: str
+    plan_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
     initial_goal: str
     overall_status: PlanStatus = PlanStatus.in_progress
@@ -165,7 +166,7 @@ class TeamAgent(BaseModel):
     input_key: str
     type: str
     name: str
-    deployment_name: str
+    deployment_name: str = ""
     system_message: str = ""
     description: str = ""
     icon: str
@@ -196,7 +197,7 @@ class TeamConfiguration(BaseDataModel):
     status: str
     created: str
     created_by: str
-    deployment_name: str
+    deployment_name: str = ""
     agents: List[TeamAgent] = Field(default_factory=list)
     description: str = ""
     logo: str = ""
@@ -267,3 +268,21 @@ class AgentMessageData(BaseDataModel):
     raw_data: str
     steps: List[Any] = Field(default_factory=list)
     next_steps: List[Any] = Field(default_factory=list)
+
+
+class ActionRequest(BaseDataModel):
+    """Request for an agent to take an action for a plan step."""
+
+    step_id: str
+    plan_id: str
+    action: str
+    agent: AgentType
+
+
+class HumanFeedback(BaseDataModel):
+    """Human feedback/approval payload for a plan step."""
+
+    step_id: str
+    plan_id: str
+    approved: bool
+    human_feedback: Optional[str] = None

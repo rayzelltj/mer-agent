@@ -5,9 +5,12 @@ from typing import List, Optional
 
 from agent_framework import (ChatAgent, ChatMessage, HostedCodeInterpreterTool,
                              Role)
-from agent_framework_azure_ai import \
-    AzureAIAgentClient  # Provided by agent_framework
-from azure.ai.projects.models import ConnectionType
+_AZURE_AI_IMPORT_ERROR: Exception | None = None
+try:
+    from agent_framework_azure_ai import AzureAIAgentClient  # Provided by agent_framework
+except Exception as exc:  # pragma: no cover
+    AzureAIAgentClient = None  # type: ignore[assignment]
+    _AZURE_AI_IMPORT_ERROR = exc
 from common.config.app_config import config
 from common.database.database_base import DatabaseBase
 from common.models.messages_af import TeamConfiguration
@@ -31,9 +34,10 @@ class FoundryAgentTemplate(AzureAgentBase):
         agent_name: str,
         agent_description: str,
         agent_instructions: str,
-        use_reasoning: bool,
+        *,
+        use_reasoning: bool = False,
         model_deployment_name: str,
-        project_endpoint: str,
+        project_endpoint: str | None = None,
         enable_code_interpreter: bool = False,
         mcp_config: MCPConfig | None = None,
         search_config: SearchConfig | None = None,
@@ -41,6 +45,9 @@ class FoundryAgentTemplate(AzureAgentBase):
         team_config: TeamConfiguration | None = None,
         memory_store: DatabaseBase | None = None,
     ) -> None:
+        if project_endpoint is None:
+            project_endpoint = config.AZURE_AI_PROJECT_ENDPOINT
+
         # Get project_client before calling super().__init__
         project_client = config.get_ai_project_client()
 
@@ -77,8 +84,10 @@ class FoundryAgentTemplate(AzureAgentBase):
             return False
         # Minimal heuristic: presence of required attributes
 
-        has_index = hasattr(self.search, "index_name") and bool(self.search.index_name)
-        if has_index:
+        has_connection_name = bool(getattr(self.search, "connection_name", None))
+        has_endpoint = bool(getattr(self.search, "endpoint", None))
+        has_index = bool(getattr(self.search, "index_name", None))
+        if has_connection_name and has_endpoint and has_index:
             self.logger.info(
                 "Azure AI Search requested (connection_id=%s, index=%s).",
                 getattr(self.search, "connection_name", None),
@@ -128,6 +137,13 @@ class FoundryAgentTemplate(AzureAgentBase):
         if chatClient:
             return chatClient
 
+        if AzureAIAgentClient is None:  # pragma: no cover
+            self.logger.error(
+                "AzureAIAgentClient is unavailable (import error: %r)",
+                _AZURE_AI_IMPORT_ERROR,
+            )
+            return None
+
         if not self.search:
             self.logger.error("Search configuration missing.")
             return None
@@ -143,6 +159,15 @@ class FoundryAgentTemplate(AzureAgentBase):
             return None
 
         resolved_connection_id = None
+
+        try:
+            from azure.ai.projects.models import ConnectionType
+        except Exception as ex:
+            self.logger.error(
+                "Azure Projects SDK is unavailable; cannot use Azure AI Search tool path: %s",
+                ex,
+            )
+            return None
 
         try:
             async for connection in self.project_client.connections.list():

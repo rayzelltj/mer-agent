@@ -16,15 +16,35 @@ rulebook:
         amount: "0.00"
         currency_dependent_rounding: false
       amount_match:
-        # Not specified in the provided Best Practices excerpt.
-        # Required for checks like "MER line equals QBO line".
-        requires_clarification: true
-        default_amount: null
+        # Default to exact match unless a client SOP overrides it.
+        requires_clarification: false
+        default_amount: "0.00"
     explanation_definition:
       # Per your clarification: ANY link OR comment qualifies as explained.
       explained_if_any:
         - comment_present
         - link_present
+
+    lead_flagging_definition:
+      # Resolved: lead flags are recorded in the MER Balance Sheet "comments" column.
+      detection:
+        source: mer_google_sheet
+        location: "Balance Sheet tab -> comments column"
+        match:
+          type: substring
+          value: "@lead"
+          case_insensitive: true
+
+    capitalization_policy:
+      # Resolved: default to $1,000 unless client KYC/SOP overrides.
+      default_threshold_amount: 1000
+      threshold_currency: "client_base_currency"
+      override_precedence:
+        - client_maintenance_kyc
+        - default
+      evidence_required_fields:
+        - threshold_amount
+        - threshold_source
     source_of_truth_precedence:
       # Per your clarification: MER is the artifact being reviewed.
       # Agent must NOT edit the MER sheet; it cross-checks it against other sources.
@@ -36,17 +56,10 @@ rulebook:
         role: "supporting_evidence_and_context"
 
   requires_clarification:
-    - id: tolerance.amount_match
-      question: "What is the global default tolerance for non-zero amount matching (MER vs QBO), and can clients override it?"
-      needed_for_rules:
-        - BS-BANK-BOOK-BALANCE-MATCH
-        - BS-PETTY-CASH-MATCH
-        - BS-WORKING-PAPER-RECONCILES
-        - BS-LOAN-AND-INVESTMENT-BALANCES-RECONCILE
-        - BS-FIXED-ASSET-REGISTER-RECONCILES
-
     - id: reconciliation.status_access
       question: "Do you have an API-accessible source for QBO reconciliation status/last reconciled date (or do we treat this as external-only evidence)?"
+      status: resolved
+      answer: "No QBO reconciliation status endpoint available; reconciliation must be inferred from Google Sheets evidence (MER/reconciliation workpapers) and treated as external evidence."
       needed_for_rules:
         - BS-BANK-RECONCILED-THROUGH-PERIOD-END
         - BS-CC-RECONCILED-THROUGH-PERIOD-END
@@ -54,16 +67,22 @@ rulebook:
 
     - id: lead_flagging.definition
       question: "How should the agent detect 'flagged to leads' in reconciliation spreadsheets (e.g., specific column, @mention, owner field)?"
+      status: resolved
+      answer: "Detect '@lead' (case-insensitive substring match) in the MER Balance Sheet comments column."
       needed_for_rules:
         - BS-UNCLEARED-ITEMS-INVESTIGATED-AND-FLAGGED
 
     - id: capitalization.threshold_default
       question: "Best Practices says '$1,000' is a good capitalization guide unless advised otherwise. Should the agent default to 1000 when no SOP/KYC threshold is provided, or always require an explicit client threshold?"
+      status: resolved
+      answer: "Default to $1,000, allow client KYC override, and record threshold source in evidence."
       needed_for_rules:
         - BS-FIXED-ASSET-CAPITALIZATION-THRESHOLD
 
     - id: clearing.acceptable_range
       question: "For non-Plooto clearing accounts, should the acceptable balance/range ALWAYS come from KYC/SOP (no defaults), and what is the schema/field for it?"
+      status: pending
+      answer: "On hold pending KYC access/location confirmation (Google Drive). Treat as KYC-driven with no defaults; if missing, raise an OBP ticket."
       needed_for_rules:
         - BS-CLEARING-ACCOUNTS-WITHIN-CLIENT-THRESHOLD
 
@@ -117,6 +136,10 @@ sources:
 rules:
   - rule_id: BS-CLEARING-ACCOUNTS-ZERO
     title: "Clearing accounts should be zero at period end"
+    category: deterministic
+    automatable: yes
+    automation_notes: "Deterministic zero-balance check using QBO Balance Sheet + MER Balance Sheet; relies on label substring matching unless client mapping overrides."
+    recommendation: MVP
     what_are_we_testing: "Clearing accounts are expected to clear to $0 at month end (unless a client-specific acceptable range exists in KYC/SOP)."
     source: "QBO Balance Sheet (actual) + MER Google Sheet (review artifact)"
     matching_against: "Zero balance"
@@ -142,6 +165,10 @@ rules:
 
   - rule_id: BS-UNDEPOSITED-FUNDS-ZERO
     title: "Undeposited Funds should be zero at period end"
+    category: deterministic
+    automatable: yes
+    automation_notes: "Deterministic zero-balance check using QBO Balance Sheet + MER Balance Sheet; relies on label substring matching."
+    recommendation: MVP
     what_are_we_testing: "Undeposited funds cleared to deposits by month end."
     source: "QBO Balance Sheet (actual) + MER Google Sheet (review artifact)"
     matching_against: "Zero balance"
@@ -164,6 +191,10 @@ rules:
 
   - rule_id: BS-PETTY-CASH-MATCH
     title: "Petty cash matches between MER and QBO"
+    category: deterministic
+    automatable: yes
+    automation_notes: "Deterministic amount match between MER Balance Sheet row and QBO Balance Sheet line. Requires a single unambiguous MER row match."
+    recommendation: MVP
     what_are_we_testing: "Petty cash on the MER Balance Sheet matches QBO Balance Sheet as-of the MER period end date."
     source: "MER Google Sheet + QBO Balance Sheet"
     matching_against: "Amount match within configured tolerance"
@@ -188,6 +219,10 @@ rules:
 
   - rule_id: BS-PETTY-CASH-FORMAL-RECONCILE-PRESENT
     title: "Petty cash has a formal reconciliation artifact"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires an agreed reconciliation artifact convention (link/tab) in Sheets/Drive plus client-provided petty cash balance evidence; often needs manual attestation."
+    recommendation: MVP
     what_are_we_testing: "When the client provides a petty cash balance to reconcile to (ideally monthly), a formal reconciliation artifact exists (workpaper/tab/link), not just an amount match."
     source: "Reconciliation spreadsheet / workpapers (Drive/Sheets) + client-provided petty cash balance evidence"
     matching_against: "Reconciliation artifact present (link or tab)"
@@ -209,6 +244,10 @@ rules:
 
   - rule_id: BS-BANK-AND-CC-INVENTORY-COVERAGE
     title: "All bank/credit card accounts from maintenance sheet are included"
+    category: deterministic
+    automatable: partial
+    automation_notes: "Deterministic once the maintenance-sheet schema and mapping rules are configured (inventory columns, account-type mapping, and MER row conventions)."
+    recommendation: MVP
     what_are_we_testing: "All accounts in the client's 'List of bank accounts and credit cards' inventory exist in QBO and are represented in the MER review package."
     source: "Client maintenance/KYC inventory + QBO Chart of Accounts + MER Balance Sheet"
     matching_against: "Presence (account name + type/category mapping)"
@@ -235,13 +274,14 @@ rules:
 
   - rule_id: BS-BANK-RECONCILED-THROUGH-PERIOD-END
     title: "Bank accounts reconciled through statement date"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "No API-accessible QBO reconciliation status; must be inferred from reconciliation spreadsheets/MER comments and treated as external evidence."
+    recommendation: Phase 2
     what_are_we_testing: "Formal reconciliations complete in QBO for all bank accounts with verifiable balances, reconciled to the statement date (through MER period end date where applicable)."
     source: "QBO reconciliation evidence (if accessible) OR reconciliation spreadsheet + bank statements"
     matching_against: "Statement date / MER period end date"
     qbo_only: false
-    requires_external_sources:
-      - reconciliation_spreadsheet
-      - client_maintenance_kyc
     evaluation:
       type: requires_external_reconciliation_verification
     outputs:
@@ -254,8 +294,46 @@ rules:
     limitations:
       - "If QBO reconciliation status is not accessible via your integration, this rule is 'needs_human_review' unless the reconciliation spreadsheet provides proof."
 
+  - rule_id: BS-BANK-BOOK-BALANCE-MATCH
+    enabled: false
+    title: "(MVP) Bank book balance matches between MER and QBO"
+    category: deterministic
+    automatable: yes
+    automation_notes: "MVP proxy check (book-to-book). Requires configuration of the MER row key and QBO label substring or explicit mapping. Does not prove statement reconciliation."
+    recommendation: MVP
+    what_are_we_testing: "MVP alternative: compare the MER balance sheet bank line item to the QBO balance sheet bank book balance as-of period end. This does not prove statement reconciliation, so keep disabled by default."
+    source: "MER Google Sheet + QBO Balance Sheet"
+    matching_against: "Equality within configured tolerance"
+    qbo_only: false
+    parameters:
+      # Client mapping may override these defaults.
+      mer_bank_row_key: "bank book balance"
+      qbo_bank_label_substring: "bank"
+      tolerance:
+        policy_ref: "policies.tolerances.amount_match"
+    evaluation:
+      type: mer_bank_balance_matches_qbo_bank_balance
+    outputs:
+      evidence_fields:
+        - period_end_date
+        - mer_row_key
+        - mer_a1_cell
+        - mer_amount
+        - qbo_label_substring
+        - qbo_first_match_raw
+        - qbo_amount
+        - delta
+        - tolerance
+    limitations:
+      - "Does not verify statement reconciliation (book balance vs book balance only)."
+      - "The default row/label match may be ambiguous; client-specific mapping should override mer_bank_row_key/qbo_bank_label_substring when needed."
+
   - rule_id: BS-CC-RECONCILED-THROUGH-PERIOD-END
     title: "Credit cards reconciled through statement date"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "No API-accessible QBO reconciliation status; must be inferred from reconciliation spreadsheets/MER comments and treated as external evidence."
+    recommendation: Phase 2
     what_are_we_testing: "Formal reconciliations complete in QBO for all credit cards with verifiable balances, reconciled to the statement date."
     source: "QBO reconciliation evidence (if accessible) OR reconciliation spreadsheet + credit card statements"
     matching_against: "Statement date"
@@ -266,8 +344,83 @@ rules:
     evaluation:
       type: requires_external_reconciliation_verification
 
+  - rule_id: BS-CC-DEBIT-BOOK-BALANCE-MATCH-ALL
+    title: "(MVP) Reconcilable account book balances match between MER and QBO"
+    category: heuristic
+    automatable: yes
+    automation_notes: "MVP proxy check (book-to-book) using heuristic account selection and label-based matching; robust MER↔QBO mapping improves accuracy. Does not prove statement reconciliation."
+    recommendation: MVP
+    what_are_we_testing: "Interim alternative: for all accounts that should be reconciled to an external statement (bank, payment processor/clearing, credit card/LOC), the MER line item matches the QBO book balance as-of period end."
+    source: "MER Google Sheet + QBO Balance Sheet"
+    matching_against: "Equality within configured tolerance"
+    qbo_only: false
+    parameters:
+      # Heuristic selectors for accounts that should be statement-reconciled.
+      qbo_include_label_contains_any:
+        - "rbc"
+        - "bank"
+        - "chequing"
+        - "checking"
+        - "savings"
+        - "paypal"
+        - "etsy"
+        - "clearing"
+        - "credit card"
+        - "visa"
+        - "mastercard"
+        - "amex"
+        - "discover"
+        - "line of credit"
+        - "loc"
+      # Exclusions: subledger/schedule-driven items (not bank-reconciled).
+      qbo_exclude_label_contains_any:
+        - "undeposited"
+        - "accounts receivable"
+        - "a/r"
+        - "accounts payable"
+        - "a/p"
+        - "inventory"
+        - "prepaid"
+        - "equipment"
+        - "furnish"
+        - "goodwill"
+        - "security deposit"
+        - "accumulated"
+        - "amortization"
+        - "depreciation"
+        - "gst"
+        - "hst"
+        - "pst"
+        - "sales tax"
+        - "income tax"
+        - "accrued"
+        - "vacation"
+        - "unearned"
+        - "wages"
+        - "petty cash"
+      tolerance:
+        policy_ref: "policies.tolerances.amount_match"
+    evaluation:
+      type: mer_credit_debit_accounts_book_balance_match_qbo
+    outputs:
+      evidence_fields:
+        - period_end_date
+        - qbo_label
+        - qbo_amount
+        - mer_a1_cell
+        - mer_amount
+        - delta
+        - tolerance
+    limitations:
+      - "Does not verify statement reconciliation (book balance vs book balance only)."
+      - "Matching is label-based; if MER row labels differ from QBO account labels, mapping rules will be needed."
+
   - rule_id: BS-UNCLEARED-ITEMS-INVESTIGATED-AND-FLAGGED
     title: "Uncleared transactions are investigated and explained"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires structured identification of uncleared items in workpapers plus explanation presence; lead flag detection uses '@lead' in the MER Balance Sheet comments column."
+    recommendation: MVP
     what_are_we_testing: "Uncleared transactions after reconciliation are investigated, flagged to leads, and have a comment/link in the reconciliation spreadsheet."
     source: "Reconciliation spreadsheet + supporting documents"
     matching_against: "Presence of explanation (comment/link) + lead flagging (definition TBD)"
@@ -295,6 +448,10 @@ rules:
 
   - rule_id: BS-UNCLEARED-ITEMS-COMMENT-WHY-NOT-CONCERN
     title: "Uncleared items include why they are not of concern"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires a defined reconciliation spreadsheet schema for uncleared items and where explanations/comments/links are stored."
+    recommendation: MVP
     what_are_we_testing: "For each uncleared item in reconciliation workpapers, there is a comment indicating why it is not of concern (e.g., clears next statement, waiting client info, steps taken, suggested resolution)."
     source: "Reconciliation spreadsheet"
     matching_against: "Presence of explanation content (comment/link)"
@@ -313,6 +470,10 @@ rules:
 
   - rule_id: BS-UNCLEARED-ITEMS-SUGGEST-DUPLICATE-SCAN
     title: "Uncleared items cross-checked vs AP/AR for duplicates"
+    category: heuristic
+    automatable: partial
+    automation_notes: "Heuristic-only; should emit warn/needs_human_review rather than deterministic failures. Requires access to uncleared items list + AP/AR detail context."
+    recommendation: Phase 2
     what_are_we_testing: "SOP-expected reviewer step (non-deterministic): compare AP/AR listings to uncleared bank/CC transactions to identify possible duplicates (e.g., cash-coded duplicates)."
     source: "QBO transactions + QBO AP/AR reports + reconciliation spreadsheet"
     matching_against: "Potential duplicate signals"
@@ -333,6 +494,10 @@ rules:
 
   - rule_id: BS-PLOOTO-CLEARING-ZERO
     title: "Plooto clearing account is zero"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Detect non-zero balance in QBO; diagnosis requires Plooto transaction report/export and a consistent mapping to the Plooto clearing account in QBO."
+    recommendation: Phase 2
     what_are_we_testing: "The Plooto Clearing account should always have a $0 balance."
     source: "QBO Balance Sheet (detect) + Plooto transaction report (diagnose)"
     matching_against: "Zero balance"
@@ -353,6 +518,10 @@ rules:
 
   - rule_id: BS-PLOOTO-INSTANT-BALANCE-DISCLOSURE
     title: "Plooto Instant live balance identified"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires Plooto live balance evidence and client KYC context about whether they keep a running float."
+    recommendation: Phase 2
     what_are_we_testing: "If there are funds in Plooto Instant, they should be identified for the client (and likely transferred back, depending on client practice)."
     source: "Plooto dashboard/live balance + client context"
     matching_against: "Non-zero live balance"
@@ -365,6 +534,10 @@ rules:
 
   - rule_id: BS-FX-ACCOUNTS-RECONCILED-MONTHLY
     title: "FX exchange accounts (Wise/OFX/etc.) reconciled monthly"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires statements from FX platform (delegate access) and a reconciliation artifact. Often depends on external platform access and manual evidence capture."
+    recommendation: Phase 2
     what_are_we_testing: "Foreign currency exchange accounts are reconciled at month end using downloaded statements (delegate access expected)."
     source: "QBO + Wise/OFX statements"
     matching_against: "Statement ending balances and reconciliation evidence"
@@ -376,6 +549,10 @@ rules:
 
   - rule_id: BS-FX-DELEGATE-ACCESS-ATTESTED
     title: "Wise/OFX delegate access confirmed"
+    category: human_review
+    automatable: no
+    automation_notes: "Delegate access is typically not API-verifiable in this workflow; requires manual attestation and evidence link."
+    recommendation: Never
     what_are_we_testing: "SOP expectation: Enkel should have delegate access to Wise/OFX (or equivalent FX platforms) used by the client. If automation cannot verify access existence, require manual attestation and record where access was confirmed."
     source: "Wise/OFX (or platform) access settings + internal access records"
     matching_against: "Delegate access confirmed"
@@ -396,6 +573,10 @@ rules:
 
   - rule_id: BS-AP-SUBLEDGER-RECONCILES
     title: "Aged Payables Detail reconciles to Balance Sheet"
+    category: deterministic
+    automatable: yes
+    automation_notes: "Deterministic if QBO Reports API access is available (Aged Payables Detail + Balance Sheet)."
+    recommendation: MVP
     what_are_we_testing: "Aged Payables Detail total reconciles to the Accounts Payable balance sheet account at period end."
     source: "QBO AgedPayablesDetail + QBO Balance Sheet"
     matching_against: "Equality within configured tolerance"
@@ -411,6 +592,10 @@ rules:
 
   - rule_id: BS-AR-SUBLEDGER-RECONCILES
     title: "Aged Receivables Detail reconciles to Balance Sheet"
+    category: deterministic
+    automatable: yes
+    automation_notes: "Deterministic if QBO Reports API access is available (Aged Receivables Detail + Balance Sheet)."
+    recommendation: MVP
     what_are_we_testing: "Aged Receivables Detail total reconciles to the Accounts Receivable balance sheet account at period end."
     source: "QBO AgedReceivablesDetail + QBO Balance Sheet"
     matching_against: "Equality within configured tolerance"
@@ -426,6 +611,10 @@ rules:
 
   - rule_id: BS-AP-AR-ITEMS-OLDER-THAN-60-DAYS
     title: "AP/AR items older than 60 days flagged"
+    category: deterministic
+    automatable: partial
+    automation_notes: "Deterministic detection of >60-day open items via QBO aging reports; explanation/comment/link presence still requires a defined comment location and validation."
+    recommendation: MVP
     what_are_we_testing: "Any open bills/invoices/payments older than 60 days are identified and require a comment/link."
     source: "QBO Aged Payables/Receivables reports + MER notes/comments"
     matching_against: "Age > 60 days"
@@ -441,6 +630,10 @@ rules:
 
   - rule_id: BS-AP-AR-NEGATIVE-OPEN-ITEMS
     title: "Negative items (credits/overpayments) identified and justified"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Detection is deterministic; justification requires linked source documentation (e.g., Dext/statement evidence) and often human confirmation."
+    recommendation: MVP
     what_are_we_testing: "Negative open AP/AR items exist only with justification (source documentation, credit application status, refund confirmation, and no duplicate cash-coding)."
     source: "QBO AP/AR detail (detect) + Dext + bank/credit card transactions (justify)"
     matching_against: "Open amount < 0"
@@ -452,6 +645,10 @@ rules:
 
   - rule_id: BS-AP-AR-PAID-BUT-STILL-OPEN
     title: "Paid-or-likely-paid transactions still open are flagged"
+    category: heuristic
+    automatable: partial
+    automation_notes: "Heuristic signal detection (e.g., RB9 references) can flag candidates, but confirming payment evidence/matching requires external docs and reviewer judgment."
+    recommendation: Phase 2
     what_are_we_testing: "Bills/invoices that appear paid (e.g., payment references on source docs) but remain open in AP/AR are flagged for investigation and explanation."
     source: "QBO AP/AR detail + Dext source docs + bank/CC transactions"
     matching_against: "Heuristic signals (payment references, known patterns)"
@@ -469,6 +666,10 @@ rules:
 
   - rule_id: BS-AP-AR-INTERCOMPANY-OR-SHAREHOLDER-PAID
     title: "Items paid by intercompany/shareholder loan identified"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires multi-entity context (related company access, account mappings) and/or structured KYC data describing intercompany/shareholder loan workflows."
+    recommendation: Phase 2
     what_are_we_testing: "Transactions paid by related companies or via shareholder loan are identified so open AP/AR can be cleared appropriately and intercompany balances remain consistent."
     source: "QBO (multiple companies) + client KYC"
     matching_against: "Evidence of payment in other entity / loan account postings"
@@ -480,6 +681,10 @@ rules:
 
   - rule_id: BS-AP-AR-FOREIGN-CURRENCY-DISCREPANCIES
     title: "Foreign currency discrepancies on AP/AR addressed"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires multi-currency context and often statement evidence; edge cases are judgment-heavy (FX rate application, cash-coding duplicates)."
+    recommendation: Phase 2
     what_are_we_testing: "Foreign currency bills paid with another currency are checked for exchange-rate application issues, over/underpayment artifacts, and matching feasibility."
     source: "QBO AP/AR + credit card statements"
     matching_against: "Currency mismatch / revaluation artifacts"
@@ -491,6 +696,10 @@ rules:
 
   - rule_id: BS-AP-AR-NEW-OVERDUE-ITEMS
     title: "Newly entered but already overdue items flagged"
+    category: human_review
+    automatable: partial
+    automation_notes: "Requires prior-cycle reference and client context to determine whether an overdue item is newly introduced vs previously known."
+    recommendation: Phase 2
     what_are_we_testing: "If new bills were provided since last AP cycle and were already overdue, they are flagged internally and to the client."
     source: "QBO transaction history + prior cycle context"
     matching_against: "Due date already past at time of entry"
@@ -502,6 +711,10 @@ rules:
 
   - rule_id: BS-AP-ENKEL-BILLS
     title: "Bills from Enkel investigated"
+    category: human_review
+    automatable: no
+    automation_notes: "Requires an internal process (#billing escalation) and confirmation of payment status; automation can only flag candidates."
+    recommendation: Never
     what_are_we_testing: "If bills from Enkel appear in AP, request made in #billing to determine whether unpaid and alert billing team."
     source: "QBO AP detail (detect) + internal process"
     matching_against: "Vendor name matches 'Enkel' (client-configurable)"
@@ -514,6 +727,10 @@ rules:
 
   - rule_id: BS-AP-AR-YEAR_END_BATCH_ADJUSTMENTS
     title: "Year-end AP/AR batch adjustments not left as generic supplier/customer"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Can detect suspicious journal entries impacting AP/AR; validating breakdown/support requires external communications or linked workpapers."
+    recommendation: MVP
     what_are_we_testing: "Year-end accountants' batch adjustments to AP/AR are not entered as generic supplier/customer without breakdown; uncleared batch adjustments are investigated and flagged."
     source: "QBO Journal Entries + QBO AP/AR detail + external year-end communication"
     matching_against: "Journal entries impacting AP/AR with insufficient transaction-level breakdown"
@@ -525,6 +742,10 @@ rules:
 
   - rule_id: BS-AP-AR-PAID-AFTER-MONTH-END-NOTED
     title: "Items paid after month-end are annotated in MER"
+    category: deterministic
+    automatable: partial
+    automation_notes: "Deterministic payment-date detection in QBO is possible; enforcing/validating that MER comments include payment date/method requires consistent comment fields in Sheets."
+    recommendation: MVP
     what_are_we_testing: "When delivering MER, items paid after month-end have comments with payment date/method."
     source: "QBO payments + MER Google Sheet comments"
     matching_against: "Payment date > MER period end"
@@ -538,6 +759,10 @@ rules:
 
   - rule_id: BS-INTERCOMPANY-BALANCES-RECONCILE
     title: "Intercompany loan balances reconcile across related companies"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires access to all related companies (multiple realmIds) and mapping of intercompany loan accounts between entities; sign inversion may be required."
+    recommendation: Phase 2
     what_are_we_testing: "If bookkeeping is done for related companies, intercompany loan balances reconcile between both entities."
     source: "QBO (multiple realmIds)"
     matching_against: "Balance equality (sign-inverted as appropriate)"
@@ -547,6 +772,10 @@ rules:
 
   - rule_id: BS-INTERCOMPANY-FORMAL-RECONCILE-IF-EOM-BALANCE
     title: "Intercompany loan formally reconciled if EOM balance provided"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "No API-accessible QBO reconciliation status; must be inferred from reconciliation spreadsheets/MER evidence and treated as external evidence."
+    recommendation: Phase 2
     what_are_we_testing: "If an end-of-month balance is available for an intercompany loan, the account is formally reconciled in both/all QBO companies."
     source: "QBO reconciliation evidence (if accessible) OR reconciliation spreadsheet"
     matching_against: "Formal reconciliation completed"
@@ -558,6 +787,10 @@ rules:
 
   - rule_id: BS-INTERCOMPANY-VARIANCE-DISCLOSED
     title: "Intercompany discrepancies included in reconciliation spreadsheet"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires reconciliation spreadsheet conventions for documenting variances and explanations."
+    recommendation: MVP
     what_are_we_testing: "Any unresolved discrepancies are included as intercompany loan variance in the bank reconciliation spreadsheet."
     source: "Reconciliation spreadsheet"
     matching_against: "Presence of variance line item + explanation"
@@ -571,6 +804,10 @@ rules:
 
   - rule_id: BS-WORKING-PAPER-RECONCILES
     title: "Working papers reconcile to Balance Sheet"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires working paper balances in Sheets (or linked) and a reliable mapping from working paper to QBO Balance Sheet line(s)."
+    recommendation: MVP
     what_are_we_testing: "Working paper balances reconcile to the financial statements (Balance Sheet lines)."
     source: "Working papers (Drive/Sheets) + QBO Balance Sheet"
     matching_against: "Amount match within configured tolerance"
@@ -586,6 +823,10 @@ rules:
 
   - rule_id: BS-WORKING-PAPER-LINKS-PRESENT-IN-MER
     title: "Links to working papers included in Balance Sheet report"
+    category: deterministic
+    automatable: yes
+    automation_notes: "Deterministic presence check for hyperlinks in MER Balance Sheet lines (given stable link conventions)."
+    recommendation: MVP
     what_are_we_testing: "Balance Sheet lines with working papers include links to the relevant working papers in the MER review package."
     source: "MER Google Sheet"
     matching_against: "Link present"
@@ -597,6 +838,10 @@ rules:
 
   - rule_id: BS-MONTH-END-JOURNALS-FROM-KYC-PROCESSED
     title: "KYC-specified month-end journals processed"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires structured KYC fields enumerating required month-end journals and a mapping to detectable QBO Journal Entry patterns."
+    recommendation: Phase 2
     what_are_we_testing: "Specific month-end journals required by the client’s KYC are processed for the period."
     source: "Client KYC + QBO Journal Entries"
     matching_against: "Presence of required journals"
@@ -608,6 +853,10 @@ rules:
 
   - rule_id: BS-WORKING-PAPER-HAS-CHECK-FORMULA
     title: "Working papers contain a check formula vs QBO"
+    category: deterministic
+    automatable: yes
+    automation_notes: "Deterministic if your working paper template has a consistent variance/check formula pattern that can be scanned in Sheets."
+    recommendation: MVP
     what_are_we_testing: "Working papers include a check formula adding the QBO balance and calculating variance."
     source: "Working paper (Sheets)"
     matching_against: "Presence of check formula / variance cell"
@@ -619,6 +868,10 @@ rules:
 
   - rule_id: BS-WORKING-PAPER-SINGLE-COPY-REUSED
     title: "Single working paper reused monthly"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires stable Drive file IDs or link metadata across periods to detect whether the same working paper is reused."
+    recommendation: Phase 2
     what_are_we_testing: "There is one working paper referenced every month (not copied each month)."
     source: "Drive metadata + MER links"
     matching_against: "Consistent file ID / link target across months"
@@ -630,6 +883,10 @@ rules:
 
   - rule_id: BS-TAX-FILINGS-UP-TO-DATE
     title: "Sales tax filings completed through most recent period"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires QBO tax filings access (if available) or external portal evidence (CRA/provincial)."
+    recommendation: Phase 2
     what_are_we_testing: "Sales tax filings have been made in QBO until the most recent period."
     source: "QBO tax filings (if accessible) + external portals as fallback"
     matching_against: "Most recent period"
@@ -641,6 +898,10 @@ rules:
 
   - rule_id: BS-TAX-PAYABLE-AND-SUSPENSE-RECONCILE-TO-RETURN
     title: "Tax payable/suspense reconcile to most recent return"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires return evidence (portal/export) and mapping of payments/refunds to suspense/payable accounts."
+    recommendation: Phase 2
     what_are_we_testing: "Payable and suspense accounts reconcile to current/most recent return; payments/refunds offset the relevant tax suspense account."
     source: "QBO accounts + QBO transactions + return evidence"
     matching_against: "Return balances"
@@ -652,6 +913,10 @@ rules:
 
   - rule_id: BS-TAX-PAYABLE-MATCHES-PORTAL
     title: "Tax payable matches CRA/provincial portal balances"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires external portal balances (CRA/provincial) and a mapping between portal liabilities and QBO accounts."
+    recommendation: Phase 2
     what_are_we_testing: "Payable accounts reconcile to balances owing as shown on CRA/provincial tax websites."
     source: "External portals + QBO"
     matching_against: "Portal balance"
@@ -663,6 +928,10 @@ rules:
 
   - rule_id: BS-TAX-INTEREST-PENALTIES-RECORDED
     title: "Tax interest/penalties recorded and payments matched"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires external notices and confirmation that QBO transactions match payment application; often needs manual review."
+    recommendation: Phase 2
     what_are_we_testing: "Any interest/penalties are recorded and payments matched correctly."
     source: "QBO transactions + external notices"
     matching_against: "Payment application evidence"
@@ -674,6 +943,10 @@ rules:
 
   - rule_id: BS-TAX-MISCLASSIFICATION-CHECK
     title: "Taxes not recorded to wrong accounts"
+    category: deterministic
+    automatable: partial
+    automation_notes: "Deterministic only with explicit account mapping rules (what constitutes misclassification for each client)."
+    recommendation: Phase 2
     what_are_we_testing: "Taxes haven’t been recorded to the wrong account (e.g., corporate tax instalments incorrectly recorded to a sales tax account)."
     source: "QBO chart of accounts + QBO transactions"
     matching_against: "Account mapping rules"
@@ -683,6 +956,10 @@ rules:
 
   - rule_id: BS-LOAN-AND-INVESTMENT-BALANCES-RECONCILE
     title: "Loans/investments reconcile to statements or schedules"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires statements/schedules (often external) and a mapping between schedule balances and QBO Balance Sheet accounts."
+    recommendation: Phase 2
     what_are_we_testing: "Loan and investment balances reconcile to statements or an interest/repayment schedule when available."
     source: "Statements/schedules + QBO Balance Sheet"
     matching_against: "Statement ending balance / schedule balance"
@@ -697,6 +974,10 @@ rules:
 
   - rule_id: BS-LOAN-SCHEDULE-LINKS-PRESENT
     title: "Interest/repayment schedules linked when available"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires link presence conventions and (optionally) Drive metadata to confirm the referenced schedule exists and is current."
+    recommendation: Phase 2
     what_are_we_testing: "Link to interest/repayment schedule is included if enough info exists to make one."
     source: "MER Google Sheet + Drive"
     matching_against: "Link present"
@@ -708,6 +989,10 @@ rules:
 
   - rule_id: BS-LOAN-MISSING-INFO-FLAGGED
     title: "Missing info/new loans flagged to reviewer"
+    category: human_review
+    automatable: no
+    automation_notes: "Determining whether info is missing/new is subjective without a structured client asset register and prior-cycle context; keep as reviewer judgment."
+    recommendation: Never
     what_are_we_testing: "If information is missing or new loans/investments appear, the reviewer is flagged."
     source: "QBO transactions + external statements"
     matching_against: "Missing support"
@@ -717,6 +1002,10 @@ rules:
 
   - rule_id: BS-CLEARING-ACCOUNTS-WITHIN-CLIENT-THRESHOLD
     title: "Clearing accounts within client-specific acceptable range"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires client-specific thresholds from KYC/SOP (no defaults). If missing, raise OBP ticket; pending KYC access."
+    recommendation: Phase 2
     what_are_we_testing: "Clearing accounts are within the acceptable balance/range documented in client KYC/SOP."
     source: "Client SOP/KYC + QBO Balance Sheet"
     matching_against: "Client-specific thresholds"
@@ -732,6 +1021,10 @@ rules:
 
   - rule_id: BS-CLEARING-ACCOUNTS-CONSISTENCY-ACROSS-MONTHS
     title: "Clearing account balances reviewed for consistency across months"
+    category: heuristic
+    automatable: yes
+    automation_notes: "Requires multi-period balance history and client-configurable variance thresholds; produces warnings rather than deterministic failures."
+    recommendation: Phase 2
     what_are_we_testing: "Clearing accounts are reviewed for consistency across months (unusual changes flagged)."
     source: "QBO Balance Sheet across months + client threshold rules"
     matching_against: "Variance thresholds"
@@ -743,6 +1036,10 @@ rules:
 
   - rule_id: BS-FIXED-ASSET-CAPITALIZATION-THRESHOLD
     title: "Capitalization threshold enforced"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Default threshold is $1,000 unless KYC overrides. Automating capitalization requires classification rules to detect capital purchases and review journal posting behavior."
+    recommendation: Phase 2
     what_are_we_testing: "New transactions are reviewed so items above the capitalization threshold are capitalized (threshold is client SOP-defined)."
     source: "Client SOP + QBO transactions"
     matching_against: "Threshold amount"
@@ -754,6 +1051,10 @@ rules:
 
   - rule_id: BS-FIXED-ASSET-REGISTER-RECONCILES
     title: "Fixed asset register reconciles to Balance Sheet"
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires a fixed asset register/depreciation schedule (Sheets/Drive) and a mapping to QBO fixed asset balances."
+    recommendation: Phase 2
     what_are_we_testing: "Depreciation schedule and/or fixed asset register is reviewed, updated, reconciled to QBO, and linked in delivery file."
     source: "Fixed asset register (Drive/Sheets) + QBO Balance Sheet"
     matching_against: "Net book value match"
@@ -768,6 +1069,10 @@ rules:
 
   - rule_id: BS-FIXED-ASSET-CLIENT-CODING-REVIEW
     title: "Client coding reviewed for expensing vs capitalizing"
+    category: human_review
+    automatable: no
+    automation_notes: "Subjective reviewer judgment about appropriate accounting treatment; automation can only surface candidates for review."
+    recommendation: Never
     what_are_we_testing: "If client coded items and reviewer believes something should be expensed instead of capitalized, it is flagged to reviewer."
     source: "QBO transactions + reviewer judgment"
     matching_against: "N/A"

@@ -11,7 +11,12 @@ from agent_framework import (
 )
 
 # from agent_framework.azure import AzureAIAgentClient
-from agent_framework_azure_ai import AzureAIAgentClient
+_AZURE_AI_IMPORT_ERROR: Exception | None = None
+try:
+    from agent_framework_azure_ai import AzureAIAgentClient
+except Exception as exc:  # pragma: no cover
+    AzureAIAgentClient = None  # type: ignore[assignment]
+    _AZURE_AI_IMPORT_ERROR = exc
 from azure.ai.agents.aio import AgentsClient
 from azure.identity.aio import DefaultAzureCredential
 from common.database.database_base import DatabaseBase
@@ -150,6 +155,11 @@ class MCPEnabledBase:
 
     def get_chat_client(self, chat_client) -> AzureAIAgentClient:
         """Return the underlying ChatClientProtocol (AzureAIAgentClient)."""
+        if AzureAIAgentClient is None:  # pragma: no cover
+            raise RuntimeError(
+                "AzureAIAgentClient is unavailable. "
+                f"Import error: {_AZURE_AI_IMPORT_ERROR!r}"
+            )
         if chat_client:
             return chat_client
         if (

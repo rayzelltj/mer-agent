@@ -13,8 +13,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.factory import Domain, MCPToolBase
-from services.mer_review_backend_client import call_mer_balance_sheet_review_backend
+from ..core.factory import Domain, MCPToolBase
+from .mer_review_backend_client import call_mer_balance_sheet_review_backend
 
 
 class MERReviewService(MCPToolBase):

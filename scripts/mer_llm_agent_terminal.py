@@ -209,6 +209,9 @@ def stream_via_websocket(cfg: Config, plan_id: str, timeout_s: int) -> int:
                             print(summary)
                         if content:
                             print(content)
+                        if not summary and not content:
+                            # Backend schemas sometimes nest fields differently; dump for debugging.
+                            print(json.dumps(msg, indent=2)[:4000])
                         final_seen = True
                         return 0
 

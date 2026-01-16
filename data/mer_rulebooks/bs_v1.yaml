@@ -1,0 +1,408 @@
+# Enkel MER — Consolidated Rulebook v0.1
+# Merged canonical rulebook, with consistency/gap notes and agent-readiness audit.
+
+# Executive summary
+# - This document consolidates the two provided YAML rulebooks and the Best Practices narrative
+#   into a single authoritative file. Rules were deduplicated, IDs normalized, and each rule
+#   annotated with: category, automatable (yes/no/partial), automation_notes, and delivery
+#   recommendation (MVP / Phase 2 / Never fully automatable).
+# - Three classes of checks are explicitly separated: deterministic (machine-checkable),
+#   SOP expectations (policy-driven, configuration required), and human-attestation controls
+#   (cannot be fully automated or require manual confirmation).
+
+# Key findings (Consistency & gap review)
+# 1. Overlaps
+#    - Many rules repeat the same intent (e.g., "Plooto Clearing zero" appears in both lists).
+#    - AP/AR subledger reconciliations and >60-day aging comments appear consistently.
+# 2. Contradictions / semantic divergences
+#    - "Formal reconciliation in QBO" vs "book balance match" (MVP). These are different proofs:
+#      - Formal reconciliation = statement-level reconciliation evidence (reconciled to statement date)
+#      - Book balance match = MER line equals QBO book balance (no statement proof). The rulebook
+#        must keep both but mark book-balance checks as weaker/MVP-only.
+#    - "Clearing accounts should be zero" vs "clearing accounts may have client-specific ranges".
+#      Resolution: prefer client KYC/SOP when present; otherwise default enforcement = zero.
+# 3. Missing rules / ambiguities
+#    - Lead-flagging detection method (column name / @mention) is undefined.
+#    - Reconciliation status API availability (QBO) needs confirmation — treat as external evidence
+#      unless integration supports it.
+#    - Capitalization threshold: doc suggests $1,000 as default unless SOP overrides; clarify default
+#      behavior for automation.
+
+# Semantic divergences called out
+# - "reconciled through period end" vs "reconciled to statement date": recommend using explicit
+#   absolute date fields (e.g., statement_date == period_end_date) and allow parameter require_statement_date_match
+# - "formal reconciliation" (has reconciliation artifact or QBO reconciliation) vs "book balance match"
+# - "Plooto Instant live balance" is a live-system check (external) and must be handled as external evidence
+# - "Delegate access" to third-party FX platforms is often manual and should be human-attested
+
+# Policies & global tolerances (normalized)
+policies:
+  tolerances:
+    symmetric: true
+    zero_balance: "0.00"
+    amount_match:
+      requires_clarification: false
+      default_amount: "0.00"
+  explanation_definition:
+    explained_if_any:
+      - comment_present
+      - link_present
+
+# Category legend
+# deterministic: exact checks using QBO / MER sheet data (can be fully automated if data accessible)
+# heuristic: algorithmic/heuristic checks that may produce "warn" or "needs_human_review"
+# requires_external_evidence: rule requires external system evidence (bank statements, Plooto, Wise)
+# human_review: requires manual attestation or subjective judgment
+
+# Recommendation legend
+# MVP: include in initial automated agent (relies on QBO + MER sheet + configured mappings)
+# Phase 2: valuable but requires additional external integrations or richer mapping data
+# Never: user-attestation or subjective rules that cannot be reliably automated
+
+# Merged rules (normalized). Each rule includes: id, title, description, source, applies_to,
+# evaluation.type, parameters, category, automatable, automation_notes, recommendation
+
+rules:
+  - id: BS.BANK.RECONCILE_EVERY_STATEMENT
+    title: "Bank & CC accounts reconciled to available statement"
+    description: "Every account listed in the client's 'List of bank accounts and credit cards' must have a formal reconciliation for the period using the available statement as of the period end date."
+    source: ["client_maintenance_kyc","reconciliation_spreadsheet","qbo"]
+    applies_to:
+      inventory_tab: "List of bank accounts and credit cards"
+    parameters:
+      require_statement_date_match: true
+    evaluation:
+      type: bank_reconciled_every_statement
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Detect presence of reconciliation artifact in MER sheet or QBO reconciliation status when available via API. If no API, require reconciliation_spreadsheet evidence. Statement file detection requires Drive/Sheets access."
+    recommendation: Phase 2
+
+  - id: BS.BANK.BOOK_BALANCE_MATCH_MVP
+    title: "(MVP) Bank book balance matches MER vs QBO"
+    description: "Interim check: compare MER bank line to QBO book balance as-of period end (does not prove statement reconciliation)."
+    source: ["mer_google_sheet","qbo"]
+    parameters:
+      mer_bank_row_key: "bank book balance"
+      qbo_label_substrings:
+        - "bank"
+        - "rbc"
+        - "paypal"
+        - "etsy"
+      tolerance_ref: "policies.tolerances.amount_match"
+    evaluation:
+      type: mer_bank_balance_matches_qbo_bank_balance
+    category: deterministic
+    automatable: yes
+    automation_notes: "Requires robust mapping from MER rows to QBO accounts (label matching or explicit mapping table)."
+    recommendation: MVP
+
+  - id: BS.UNCLEARED.ITEMS_INVESTIGATED_AND_FLAGGED
+    title: "Uncleared transactions investigated & flagged"
+    description: "Uncleared transactions after reconciliation must have an investigation comment and be flagged to leads."
+    source: ["reconciliation_spreadsheet","mer_google_sheet"]
+    parameters:
+      comment_required: true
+      notify_lead_required: true
+      lead_flagging_ref: "requires_clarification.lead_flagging.definition"
+    evaluation:
+      type: uncleared_items_flagged
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Agent can detect uncleared items and presence of comment/link, but cannot reliably detect a 'lead flag' without a configured column/format. Recommend configurable flag-column names or tagging convention."
+    recommendation: MVP
+
+  - id: BS.PLOOTO.CLEARING_ZERO
+    title: "Plooto Clearing account must be zero"
+    description: "Plooto clearing account expected to be $0 at period end; if not, provide diagnosis hints."
+    source: ["qbo","plooto"]
+    parameters:
+      tolerance: "0.00"
+    evaluation:
+      type: balance_sheet_line_items_must_be_zero_with_external_diagnosis
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Detect QBO line and check external Plooto transaction report. Diagnosis requires Plooto transaction data."
+    recommendation: Phase 2
+
+  - id: BS.PLOOTO.INSTANT_BALANCE_IDENTIFIED
+    title: "Plooto Instant live balance disclosure"
+    description: "Identify non-zero Plooto Instant live balances and recommend transfer if client doesn't keep float."
+    source: ["plooto","client_maintenance_kyc"]
+    evaluation:
+      type: external_live_balance_check
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires Plooto API or exported dashboard snapshot and client KYC config indicating float behavior."
+    recommendation: Phase 2
+
+  - id: BS.FX.DELEGATE_ACCESS_AND_STATEMENT
+    title: "FX accounts: delegate access and statement download"
+    description: "Wise/OFX and other FX accounts should have delegate access and downloadable statements for month-end reconciliation."
+    source: ["client_maintenance_kyc","external_platforms"]
+    evaluation:
+      type: delegate_access_and_statement_exists
+    category: human_review
+    automatable: no
+    automation_notes: "Access existence often not API-verifiable; requires manual attestation and a recorded evidence link."
+    recommendation: Never
+
+  - id: BS.CLEARING.ACCOUNTS_SOP
+    title: "Clearing accounts: SOP/KYC guidance or OBP ticket"
+    description: "Check client SOP/KYC for clearing account acceptable ranges; raise OBP ticket if missing."
+    source: ["client_maintenance_kyc","qbo"]
+    evaluation:
+      type: clearing_accounts_sop_or_ticket_present
+    category: human_review
+    automatable: partial
+    automation_notes: "Agent can detect presence of a KYC field; action to create OBP ticket can be automated if the organization's ticketing API is available."
+    recommendation: Phase 2
+
+  - id: BS.PETTY.CASH_RECONCILED_IF_PROVIDED
+    title: "Petty cash reconciliation required when client provides balance"
+    description: "If client provides a petty cash balance (monthly preferred), a formal reconciliation artifact should exist."
+    source: ["mer_google_sheet","reconciliation_spreadsheet","client_maintenance_kyc"]
+    evaluation:
+      type: petty_cash_reconciled_if_provided
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Agent can detect balance and presence of reconciliation link, but client confirmation may be required in many cases."
+    recommendation: MVP
+
+  - id: BS.LOANS_INVESTMENTS_SCHEDULES
+    title: "Loans and investments have schedules/statements"
+    description: "Loans/mortgages/term deposits/GICs/investments should have schedules or statements and be reconciled monthly."
+    source: ["client_maintenance_kyc","mer_google_sheet","qbo"]
+    evaluation:
+      type: schedules_or_statements_present_and_reconciled
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Agent can check for linked schedule/doc and compare balances; if missing, flag reviewer."
+    recommendation: Phase 2
+
+  - id: BS.AP_SUBLEDGER_RECONCILES
+    title: "Aged Payables Detail reconciles to Balance Sheet"
+    description: "Aged Payables Detail total must reconcile to the Accounts Payable balance sheet account at period end."
+    source: ["qbo"]
+    parameters:
+      tolerance_ref: "policies.tolerances.amount_match"
+    evaluation:
+      type: qbo_report_total_matches_balance_sheet_line
+      qbo_reports_required: ["aged_payables_detail","balance_sheet"]
+    category: deterministic
+    automatable: yes
+    automation_notes: "Requires QBO reports access."
+    recommendation: MVP
+
+  - id: BS.AR_SUBLEDGER_RECONCILES
+    title: "Aged Receivables Detail reconciles to Balance Sheet"
+    description: "Aged Receivables Detail total must reconcile to the Accounts Receivable balance sheet account."
+    source: ["qbo"]
+    parameters:
+      tolerance_ref: "policies.tolerances.amount_match"
+    evaluation:
+      type: qbo_report_total_matches_balance_sheet_line
+      qbo_reports_required: ["aged_receivables_detail","balance_sheet"]
+    category: deterministic
+    automatable: yes
+    automation_notes: "Requires QBO reports access."
+    recommendation: MVP
+
+  - id: BS.AP_AR_OVER60_COMMENT
+    title: "Open AP/AR items older than 60 days require comment"
+    description: "Any open bills/invoices/payments older than 60 days must be investigated and have a comment describing follow-up."
+    source: ["qbo","mer_google_sheet","reconciliation_spreadsheet"]
+    parameters:
+      days_threshold: 60
+    evaluation:
+      type: ap_ar_items_older_than_days_have_comments
+    category: deterministic
+    automatable: partial
+    automation_notes: "Agent can find >60-day items and detect presence of MER comment/link; content quality requires human review."
+    recommendation: MVP
+
+  - id: BS.FOREX.REVALUATION_AND_PER_CURRENCY_APAR
+    title: "Multi-currency: revaluation and per-currency AP/AR checks"
+    description: "Ensure currency revaluation posted, filter AP/AR by currency, compare revalued open balances to balance sheet."
+    source: ["qbo"]
+    evaluation:
+      type: forex_revaluation_and_per_currency_reconcile
+    category: deterministic
+    automatable: partial
+    automation_notes: "Requires QBO multi-currency report access and clear revaluation postings. Some edge-cases require manual FX review."
+    recommendation: Phase 2
+
+  - id: BS.PAID_LIKELY_TRANSACTIONS
+    title: "Probable paid transactions: capture payment evidence"
+    description: "Transactions that look like payments (RB9 refs, mobile tokens, card refs) should have payment evidence or a note."
+    source: ["dext","bank_transactions","qbo"]
+    parameters:
+      payment_patterns: ["RB9","mobile_wallet_token"]
+    evaluation:
+      type: probable_payment_identified_and_evidence_recorded
+    category: heuristic
+    automatable: partial
+    automation_notes: "Agent can pattern-match references and search bank transactions, but matching may be fuzzy and produce false positives."
+    recommendation: Phase 2
+
+  - id: BS.YEAR_END_ADJUSTMENTS_DETAIL
+    title: "Year-end batch adjustments must have breakdowns"
+    description: "Year-end batch adjustments to AP/AR must have supporting breakdowns; uncleared adjustments must be flagged."
+    source: ["qbo","mer_google_sheet"]
+    evaluation:
+      type: year_end_adjustments_detail_required
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Detect journal entries and missing supporting links; follow-up requires human escalation."
+    recommendation: MVP
+
+  - id: BS.INTERCOMPANY_RECONCILE
+    title: "Intercompany loan balances reconcile across related companies"
+    description: "Intercompany balances should reconcile between related entities; unresolved variances documented in reconciliation spreadsheet."
+    source: ["qbo_multi_realm","mer_google_sheet"]
+    evaluation:
+      type: intercompany_balances_reconcile_between_companies
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires access to all related QBO realms and mapping between companies; Xero limitation noted."
+    recommendation: Phase 2
+
+  - id: BS.PREPAYMENTS_WORKING_PAPERS
+    title: "Prepayments/deferred revenue/accruals working papers reconciled"
+    description: "Working papers for prepayments/deferred revenue/accruals must be linked, reviewed and reconcile to the Balance Sheet."
+    source: ["mer_google_sheet","reconciliation_spreadsheet"]
+    evaluation:
+      type: working_papers_reconciled_and_linked
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Agent can check links and a variance formula presence but cannot validate reviewer judgment."
+    recommendation: MVP
+
+  - id: BS.TAX.ACCOUNTS_RECONCILE
+    title: "Tax payable/suspense reconcile to latest filed returns"
+    description: "Sales tax, corporate tax, payroll tax payable and suspense accounts should reconcile to the most recent filed return."
+    source: ["qbo","tax_portals"]
+    evaluation:
+      type: tax_accounts_reconcile_to_return_balances
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Requires external portal access (CRA / provincial) or manual attestation."
+    recommendation: Phase 2
+
+  - id: BS.FIXED_ASSETS_CAP_THRESHOLD
+    title: "Fixed assets capitalization threshold & schedule"
+    description: "Check SOP for capitalization threshold (default $1,000). Items above threshold should be capitalized; depreciation schedule reconciled."
+    source: ["client_maintenance_kyc","qbo","mer_google_sheet"]
+    parameters:
+      default_cap_threshold: 1000
+    evaluation:
+      type: fixed_assets_capitalization_and_schedule_reconciled
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "Agent can detect transactions above threshold and missing FA register link; final capitalization judgment may require human review."
+    recommendation: MVP
+
+  - id: BS.WORKING_PAPER_LINKS_PRESENT_IN_MER
+    title: "Working paper links included in Balance Sheet report"
+    description: "Balance Sheet lines should include links to relevant working papers in the MER review package."
+    source: ["mer_google_sheet"]
+    evaluation:
+      type: mer_lines_require_link_to_support
+    category: deterministic
+    automatable: yes
+    automation_notes: "Simple presence check for hyperlink cells."
+    recommendation: MVP
+
+  - id: BS.WORKING_PAPER_SINGLE_COPY_REUSED
+    title: "Single working paper reused monthly"
+    description: "Prefer referencing a single working paper monthly instead of copying. Detect consistent file ID across months."
+    source: ["drive_metadata","mer_google_sheet"]
+    evaluation:
+      type: working_paper_link_consistency
+    category: deterministic
+    automatable: yes
+    automation_notes: "Requires Drive file IDs or stable link metadata."
+    recommendation: Phase 2
+
+  - id: BS.TAX_FILINGS_UP_TO_DATE
+    title: "Sales tax filings completed through most recent period"
+    description: "Verify sales tax filings exist through the most recent period (QBO or external portal)."
+    source: ["qbo","tax_portals"]
+    evaluation:
+      type: requires_external_tax_filing_verification
+    category: requires_external_evidence
+    automatable: partial
+    automation_notes: "External portal access required; otherwise human attestation."
+    recommendation: Phase 2
+
+  - id: BS.PAID_BUT_STILL_OPEN_HEURISTIC
+    title: "Paid-or-likely-paid transactions still open"
+    description: "Identify bills/invoices that appear paid (payment references, RB9 patterns) but remain open in AP/AR."
+    source: ["dext","qbo","bank_transactions"]
+    parameters:
+      heuristics:
+        rb9_reference_prefix: '^RB9'
+    evaluation:
+      type: heuristic_paid_but_open_detection
+    category: heuristic
+    automatable: partial
+    automation_notes: "Heuristics can flag likely candidates; human confirmation required."
+    recommendation: Phase 2
+
+  - id: BS.NEGATIVE_OPEN_ITEMS_JUSTIFIED
+    title: "Negative open AP/AR items identified and justified"
+    description: "Negative items (credits/overpayments) must have source documentation or justification."
+    source: ["qbo","dext"]
+    evaluation:
+      type: detect_negative_open_items_and_require_external_justification
+    category: deterministic
+    automatable: partial
+    automation_notes: "Agent can detect negative amounts and check for linked docs. If absent, flag."
+    recommendation: MVP
+
+  - id: BS.CLEARING_ACCOUNTS_CONSISTENCY_ACROSS_MONTHS
+    title: "Clearing accounts reviewed for consistency across months"
+    description: "Review clearing account trends and flag unusual month-to-month variance."
+    source: ["qbo","client_maintenance_kyc"]
+    evaluation:
+      type: multi_period_variance_review
+    category: heuristic
+    automatable: yes
+    automation_notes: "Requires multi-period balance history and configurable variance thresholds."
+    recommendation: Phase 2
+
+  - id: BS.WORKING_PAPER_CHECK_FORMULA
+    title: "Working papers contain a check formula vs QBO"
+    description: "Working papers include a check formula adding the QBO balance and calculating variance."
+    source: ["reconciliation_spreadsheet"]
+    evaluation:
+      type: working_paper_integrity_check
+    category: deterministic
+    automatable: yes
+    automation_notes: "Scan sheet for formula patterns or explicit variance cell."
+    recommendation: MVP
+
+# End of rules
+
+# Appendix: agent-readiness summary (high-level)
+# - Data sources required for full automation: QBO Reports API, MER Google Sheet (read access),
+#   Reconciliation spreadsheets/Drive, Dext exports, Plooto export/API, tax portal access (CRA/provincial),
+#   and mapping between MER rows and QBO account IDs.
+# - MVP scope (automatable today with QBO + MER + mapping):
+#   - Book balance matches (MER vs QBO), AP/AR subledger vs BS reconciliation, >60 day items detection,
+#     working paper link presence, negative item detection, working paper check formula, unpaid batch detection alerting.
+# - Phase 2 (requires additional external connectors or KYC structuring):
+#   - Plooto statement diagnosis, Plooto Instant live balance, multi-currency revaluation full automation,
+#     tax portal matching, intercompany multi-realm reconciliation.
+# - Never (manual/human):
+#   - FX delegate access attestation, subjective reviewer judgments about materiality/coding choices,
+#     lead-flag semantic detection without configuration.
+
+# Next actions (suggested):
+# 1. Confirm preferred default for capitalization threshold (kept at $1,000 here) and rule for clearing accounts default (zero unless KYC override).
+# 2. Provide mapping table for MER row labels -> QBO account IDs to maximize deterministic automation.
+# 3. Define lead-flagging convention (column name(s) or tags) to allow automation to detect flags.
+
+# Version: 0.1
+# Author: merged by assistant
+# Timestamp: 2026-01-16

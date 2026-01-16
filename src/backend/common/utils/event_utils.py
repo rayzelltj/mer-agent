@@ -1,7 +1,11 @@
 import logging
 
-from azure.monitor.events.extension import track_event
-from common.config.app_config import config
+try:
+    from azure.monitor.events.extension import track_event
+except Exception:  # pragma: no cover
+    track_event = None
+
+from src.backend.common.config.app_config import config
 
 
 def track_event_if_configured(event_name: str, event_data: dict):
@@ -15,6 +19,9 @@ def track_event_if_configured(event_name: str, event_data: dict):
         event_data: Dictionary of event data/dimensions
     """
     try:
+        if track_event is None:
+            return
+
         instrumentation_key = config.APPLICATIONINSIGHTS_CONNECTION_STRING
         if instrumentation_key:
             track_event(event_name, event_data)

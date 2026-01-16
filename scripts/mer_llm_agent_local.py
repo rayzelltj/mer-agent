@@ -11,6 +11,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import date as _date
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -134,6 +135,18 @@ def _clip(s: str, max_len: int) -> str:
     if max_len >= 0 and len(s) > max_len:
         return s[:max_len] + "…"
     return s
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    # Avoid leaking secrets in logs.
+    redacted = dict(cfg)
+    if redacted.get("azure_openai_api_key"):
+        redacted["azure_openai_api_key"] = "***REDACTED***"
+    return redacted
 
 
 def _format_generic_tool_bullets(last_tool_results: list[dict], *, bullets: int) -> str:
@@ -279,6 +292,118 @@ def _format_mer_review_bullets(result: dict, *, bullets: int) -> str:
     return "\n".join(candidates[:bullets])
 
 
+def _wants_detailed_failures(prompt: str) -> bool:
+    p = prompt.lower()
+    needles = [
+        "list each failed",
+        "list each failure",
+        "list failed",
+        "failed rule",
+        "failed rules",
+        "failed check",
+        "failed checks",
+        "key evidence",
+        "exact amounts",
+    ]
+    return any(n in p for n in needles)
+
+
+def _format_mer_review_detailed(result: dict) -> str:
+    summary = result.get("summary") or {}
+    failed = result.get("failed") or []
+    action_items = result.get("action_items") or []
+    req = result.get("requires_clarification") or []
+
+    lines: list[str] = []
+    lines.append(f"Period end: {result.get('period_end_date')}")
+    lines.append(
+        "Checks: "
+        f"passed={summary.get('passed')} failed={summary.get('failed')} "
+        f"unimplemented={summary.get('unimplemented')} skipped={summary.get('skipped')}"
+    )
+
+    lines.append("")
+    lines.append("Failed checks:")
+    if not failed:
+        lines.append("- None")
+    else:
+        for f in failed:
+            if not isinstance(f, dict):
+                continue
+            rid = f.get("rule_id")
+            et = f.get("evaluation_type")
+            ev = f.get("evidence") or {}
+            if not isinstance(ev, dict):
+                ev = {"evidence": ev}
+
+            # Key evidence fields (best-effort across eval types)
+            tol = ev.get("tolerance")
+            delta = ev.get("delta")
+            msg = ev.get("message") or ev.get("reason")
+            matched_row_label = ((ev.get("aging_report_evidence") or {}).get("matched_row_label") if isinstance(ev.get("aging_report_evidence"), dict) else None)
+
+            lines.append(f"- {rid} ({et})")
+            if tol is not None:
+                lines.append(f"  tolerance={tol}")
+            if delta is not None:
+                lines.append(f"  delta={delta}")
+            if matched_row_label is not None:
+                lines.append(f"  matched_row_label={matched_row_label}")
+
+            # Common amount fields
+            for k in [
+                "mer_amount",
+                "qbo_amount",
+                "balance_sheet_amount",
+                "aging_report_total",
+                "total_over_threshold",
+            ]:
+                if k in ev and ev.get(k) is not None:
+                    lines.append(f"  {k}={ev.get(k)}")
+
+            # For zero checks: show the first MER/QBO match amounts if present.
+            mer_matches = ev.get("mer_matches")
+            qbo_matches = ev.get("qbo_matches")
+            if isinstance(mer_matches, list) and mer_matches:
+                mm0 = mer_matches[0] if isinstance(mer_matches[0], dict) else None
+                if mm0 and mm0.get("amount") is not None:
+                    lines.append(f"  mer_match_amount={mm0.get('amount')} (raw={mm0.get('amount_raw')})")
+            if isinstance(qbo_matches, list) and qbo_matches:
+                qm0 = qbo_matches[0] if isinstance(qbo_matches[0], dict) else None
+                if qm0 and qm0.get("amount") is not None:
+                    lines.append(f"  qbo_match_amount={qm0.get('amount')} (raw={qm0.get('amount_raw')})")
+
+            if msg:
+                msg_s = str(msg)
+                msg_s = msg_s.replace("\n", " ")
+                lines.append(f"  note={_clip(msg_s, 220)}")
+
+    lines.append("")
+    lines.append("Action items:")
+    if not isinstance(action_items, list) or not action_items:
+        lines.append("- None")
+    else:
+        for x in action_items:
+            if not isinstance(x, dict):
+                continue
+            rid = x.get("rule_id")
+            acts = x.get("actions")
+            lines.append(f"- {rid}: {acts}")
+
+    lines.append("")
+    lines.append("Clarifications needed:")
+    if not isinstance(req, list) or not req:
+        lines.append("- None")
+    else:
+        for x in req:
+            if isinstance(x, dict):
+                lines.append(f"- {x.get('id')}: {_clip(str(x.get('question') or ''), 240)}")
+            else:
+                lines.append(f"- {x}")
+
+    return "\n".join(lines)
+
+
 def tool_qbo_balance_sheet(end_date: str) -> dict:
     from src.backend.v4.integrations.qbo_client import QBOClient
     from src.backend.v4.integrations.qbo_reports import extract_balance_sheet_items
@@ -315,6 +440,7 @@ def tool_mer_balance_sheet_review(
 
     from src.backend.v4.integrations.google_sheets_reader import (
         GoogleSheetsReader,
+        _col_to_a1,
         find_values_for_rows_containing,
     )
     from src.backend.v4.integrations.qbo_client import QBOClient
@@ -341,17 +467,104 @@ def tool_mer_balance_sheet_review(
     zero_amount = ((tolerances.get("zero_balance") or {}).get("amount"))
     zero_tolerance = _decimal_from_amount_str(zero_amount)
 
-    # amount_match explicitly requires clarification in the rulebook; default exact match
-    amount_match_tolerance = Decimal("0.00")
+    # amount_match tolerance is driven by the rulebook policy.
+    amount_default = ((tolerances.get("amount_match") or {}).get("default_amount"))
+    amount_match_tolerance = _decimal_from_amount_str(amount_default)
 
     # Fetch MER sheet
     reader = GoogleSheetsReader.from_env()
 
+    def _qbo_item_label(item: Any) -> str:
+        # QBO balance sheet items are usually ReportLineItem(label, amount)
+        if isinstance(item, dict):
+            return str(item.get("label") or item.get("name") or "")
+        return str(getattr(item, "label", None) or getattr(item, "name", "") or "")
+
+    def _qbo_item_amount_raw(item: Any) -> Any:
+        if isinstance(item, dict):
+            return item.get("amount") if "amount" in item else item.get("value")
+        return getattr(item, "amount", None) if hasattr(item, "amount") else getattr(item, "value", None)
+
+    def _safe_mkdir(path: str) -> None:
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            return
+
+    def _write_json_artifact(*, out_dir: str, filename: str, payload: dict) -> str | None:
+        try:
+            _safe_mkdir(out_dir)
+            out_path = os.path.join(out_dir, filename)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            return out_path
+        except Exception:
+            return None
+
+    def _overall_line_status(check_statuses: list[str]) -> str:
+        if any(s == "failed" for s in check_statuses):
+            return "fail"
+        if any(s in {"needs_human_review", "skipped", "unimplemented"} for s in check_statuses):
+            return "flag"
+        if check_statuses and all(s == "passed" for s in check_statuses):
+            return "pass"
+        return "unreviewed"
+
+    def _summarize_for_cell(*, overall: str, checks: list[dict]) -> str:
+        if overall == "pass":
+            return "PASS"
+        if overall == "unreviewed":
+            return ""
+        # Prefer the first non-passing check to summarize.
+        focus = next((c for c in checks if c.get("status") != "passed"), checks[0] if checks else None)
+        if not focus:
+            return ""
+        rid = focus.get("rule_id") or ""
+        note = (focus.get("note") or "").strip()
+        prefix = "FAIL" if overall == "fail" else "FLAG"
+        msg = f"{prefix}: {rid}"
+        if note:
+            msg += f" — {note}"
+        # Keep cell text readable.
+        max_len = int(os.environ.get("MER_AGENT_SHEET_CELL_MAX_CHARS", "450"))
+        return msg if max_len < 0 or len(msg) <= max_len else (msg[:max_len] + "…")
+
+    line_results_by_row: dict[int, dict] = {}
+
+    def _ensure_line_from_match(m: Any) -> dict:
+        # m is SheetRowMatch
+        row_index = int(m.row_index)
+        if row_index not in line_results_by_row:
+            line_results_by_row[row_index] = {
+                "mer": {
+                    "row_index": row_index,
+                    "a1_cell": m.a1_cell,
+                    "row_text": str(m.row_text or ""),
+                    "value_raw": m.value,
+                    "amount": str(parse_money(m.value)) if parse_money(m.value) is not None else None,
+                },
+                "checks": [],
+            }
+        return line_results_by_row[row_index]
+
+    def _add_line_check(*, m: Any, rule_id: str, evaluation_type: str, status: str, note: str, evidence: dict) -> None:
+        entry = _ensure_line_from_match(m)
+        entry["checks"].append(
+            {
+                "rule_id": rule_id,
+                "evaluation_type": evaluation_type,
+                "status": status,
+                "note": note,
+                "evidence": evidence,
+            }
+        )
+
     sheet = mer_sheet
     if not sheet:
         titles = reader.list_sheet_titles()
-        if "Balance Sheet" in titles:
-            sheet = "Balance Sheet"
+        title_map = {str(t or "").strip().lower(): t for t in titles}
+        if "balance sheet" in title_map:
+            sheet = title_map["balance sheet"]
         else:
             raise ValueError(f"mer_sheet is required. Available sheets: {titles}")
 
@@ -390,6 +603,7 @@ def tool_mer_balance_sheet_review(
         "balance_sheet_line_items_must_be_zero",
         "mer_line_amount_matches_qbo_line_amount",
         "mer_bank_balance_matches_qbo_bank_balance",
+        "mer_credit_debit_accounts_book_balance_match_qbo",
         "qbo_report_total_matches_balance_sheet_line",
         "qbo_aging_items_older_than_threshold_require_explanation",
     }
@@ -490,6 +704,17 @@ def tool_mer_balance_sheet_review(
         if not rule_id or not eval_type:
             continue
 
+        if rule.get("enabled") is False:
+            results.append(
+                {
+                    "rule_id": rule_id,
+                    "status": "skipped",
+                    "evaluation_type": eval_type,
+                    "evidence": _truncate_evidence({"reason": "disabled_by_rulebook"}),
+                }
+            )
+            continue
+
         if eval_type not in implemented_types:
             results.append({"rule_id": rule_id, "status": "unimplemented", "evaluation_type": eval_type})
             continue
@@ -512,6 +737,39 @@ def tool_mer_balance_sheet_review(
                 header_row_index=header_row_index,
             )
 
+            qbo_match_items = [x for x in (qbo_items or []) if substring.lower() in _qbo_item_label(x).lower()]
+            qbo_amount_raw = find_first_amount(qbo_items, name_substring=substring)
+            qbo_amount = parse_money(qbo_amount_raw)
+
+            for m in mer_matches:
+                mer_amount = parse_money(m.value)
+                mer_ok = mer_amount is not None and abs(mer_amount) <= zero_tolerance
+                qbo_ok = qbo_amount is not None and abs(qbo_amount) <= zero_tolerance
+                per_row_status = "passed" if (mer_ok and qbo_ok) else "failed"
+                _add_line_check(
+                    m=m,
+                    rule_id=str(rule_id),
+                    evaluation_type=eval_type,
+                    status=per_row_status,
+                    note=f"Expected zero; MER={mer_amount} QBO={qbo_amount}",
+                    evidence={
+                        "label_substring": substring,
+                        "mer_a1_cell": m.a1_cell,
+                        "mer_value_raw": m.value,
+                        "mer_amount": str(mer_amount) if mer_amount is not None else None,
+                        "qbo_amount_raw": qbo_amount_raw,
+                        "qbo_amount": str(qbo_amount) if qbo_amount is not None else None,
+                        "qbo_matches": [
+                            {
+                                "label": _qbo_item_label(x),
+                                "amount": _qbo_item_amount_raw(x),
+                            }
+                            for x in qbo_match_items[:10]
+                        ],
+                        "zero_tolerance": str(zero_tolerance),
+                    },
+                )
+
             mer_lines = [(m.row_text, m.value) for m in mer_matches]
             check = check_zero_on_both_sides_by_substring(
                 check_id=str(rule_id),
@@ -527,7 +785,214 @@ def tool_mer_balance_sheet_review(
                     "rule_id": rule_id,
                     "status": "passed" if check.passed else "failed",
                     "evaluation_type": eval_type,
-                    "evidence": _truncate_evidence(check.details),
+                    "evidence": _truncate_evidence(
+                        {
+                            **check.details,
+                            "mer_matches": [
+                                {
+                                    "a1_cell": m.a1_cell,
+                                    "row_index": m.row_index,
+                                    "row_text": m.row_text,
+                                    "value_raw": m.value,
+                                }
+                                for m in mer_matches
+                            ],
+                        }
+                    ),
+                }
+            )
+            continue
+
+        if eval_type == "mer_credit_debit_accounts_book_balance_match_qbo":
+            params = rule.get("parameters") or {}
+            include_tokens = params.get("qbo_include_label_contains_any")
+            if not isinstance(include_tokens, list) or not include_tokens:
+                # Heuristic: accounts with external statements (banks, payment processors/clearing, cards/LOC).
+                include_tokens = [
+                    # Banks / cash equivalents
+                    "bank",
+                    "chequing",
+                    "checking",
+                    "savings",
+                    "rbc",
+                    # Payment processors / clearing
+                    "paypal",
+                    "etsy",
+                    "clearing",
+                    # Credit cards / LOC
+                    "credit card",
+                    "visa",
+                    "mastercard",
+                    "amex",
+                    "discover",
+                    "line of credit",
+                    "loc",
+                ]
+
+            exclude_tokens = params.get("qbo_exclude_label_contains_any")
+            if not isinstance(exclude_tokens, list) or not exclude_tokens:
+                # Heuristic: subledger/schedule-driven items (no external statement reconciliation).
+                exclude_tokens = [
+                    "accounts receivable",
+                    "a/r",
+                    "accounts payable",
+                    "a/p",
+                    "inventory",
+                    "prepaid",
+                    "equipment",
+                    "furnish",
+                    "goodwill",
+                    "security deposit",
+                    "accumulated",
+                    "amortization",
+                    "depreciation",
+                    "gst",
+                    "hst",
+                    "pst",
+                    "sales tax",
+                    "income tax",
+                    "accrued",
+                    "vacation",
+                    "unearned",
+                    "wages",
+                    "petty cash",
+                ]
+
+            include_lowered = [str(k).strip().lower() for k in include_tokens if str(k).strip()]
+            exclude_lowered = [str(k).strip().lower() for k in exclude_tokens if str(k).strip()]
+
+            def _is_reconcilable_label(label: str) -> bool:
+                ll = (label or "").strip().lower()
+                if not ll:
+                    return False
+                # Special-case: investigated, not bank-reconciled.
+                if "undeposited" in ll:
+                    return False
+                if any(bad in ll for bad in exclude_lowered):
+                    return False
+                return any(tok in ll for tok in include_lowered)
+
+            candidates = [it for it in (qbo_items or []) if _is_reconcilable_label(_qbo_item_label(it))]
+
+            def _candidate_mer_match_keys(qbo_label: str) -> list[str]:
+                # Generate a few increasingly fuzzy keys to find the corresponding MER row.
+                s = (qbo_label or "").strip()
+                if not s:
+                    return []
+                keys: list[str] = [s]
+                # Remove common prefixes
+                for prefix in ["rbc - ", "rbc "]:
+                    if s.lower().startswith(prefix):
+                        keys.append(s[len(prefix) :].strip())
+                # Split on separators (often account numbers like 3514/3522)
+                for sep in ["/", "-", ":"]:
+                    if sep in s:
+                        parts = [p.strip() for p in s.split(sep) if p.strip()]
+                        keys.extend(parts[:3])
+                # Extract digit groups (last4 etc.) to match rows that only show numbers.
+                digit_groups = re.findall(r"\d{3,6}", s)
+                keys.extend(digit_groups[-3:])
+                # Deduplicate while preserving order
+                out: list[str] = []
+                seen: set[str] = set()
+                for k in keys:
+                    kk = k.strip()
+                    if not kk:
+                        continue
+                    norm = kk.lower()
+                    if norm in seen:
+                        continue
+                    seen.add(norm)
+                    out.append(kk)
+                return out[:10]
+
+            missing_mer: list[str] = []
+            mismatches: list[dict] = []
+
+            for it in candidates:
+                qbo_label = _qbo_item_label(it)
+                qbo_amount_raw = _qbo_item_amount_raw(it)
+                qbo_amount = parse_money(str(qbo_amount_raw) if qbo_amount_raw is not None else None)
+
+                mer_matches: list[Any] = []
+                for key in _candidate_mer_match_keys(qbo_label):
+                    mer_matches = find_values_for_rows_containing(
+                        rows=rows,
+                        row_substring=key,
+                        col_header=selected_month,
+                        header_row_index=header_row_index,
+                    )
+                    if mer_matches:
+                        break
+                if not mer_matches:
+                    missing_mer.append(qbo_label)
+                    continue
+
+                for m in mer_matches:
+                    mer_amount = parse_money(m.value)
+                    delta = (
+                        mer_amount - qbo_amount
+                        if mer_amount is not None and qbo_amount is not None
+                        else None
+                    )
+                    passed = (
+                        mer_amount is not None
+                        and qbo_amount is not None
+                        and abs(delta or Decimal("0")) <= amount_match_tolerance
+                    )
+                    if not passed:
+                        mismatches.append(
+                            {
+                                "qbo_label": qbo_label,
+                                "mer_a1_cell": m.a1_cell,
+                                "mer_value_raw": m.value,
+                                "qbo_amount_raw": qbo_amount_raw,
+                                "delta": str(delta) if delta is not None else None,
+                            }
+                        )
+
+                    _add_line_check(
+                        m=m,
+                        rule_id=str(rule_id),
+                        evaluation_type=eval_type,
+                        status="passed" if passed else "failed",
+                        note=f"{qbo_label}: MER={mer_amount} QBO={qbo_amount} Δ={delta}",
+                        evidence={
+                            "qbo_label": qbo_label,
+                            "qbo_amount_raw": qbo_amount_raw,
+                            "qbo_amount": str(qbo_amount) if qbo_amount is not None else None,
+                            "mer_a1_cell": m.a1_cell,
+                            "mer_value_raw": m.value,
+                            "mer_amount": str(mer_amount) if mer_amount is not None else None,
+                            "tolerance": str(amount_match_tolerance),
+                            "delta": str(delta) if delta is not None else None,
+                        },
+                    )
+
+            status = "passed"
+            if mismatches or missing_mer:
+                status = "failed"
+            if not candidates:
+                status = "skipped"
+
+            results.append(
+                {
+                    "rule_id": rule_id,
+                    "status": status,
+                    "evaluation_type": eval_type,
+                    "evidence": _truncate_evidence(
+                        {
+                            "include_tokens": include_lowered,
+                            "exclude_tokens": exclude_lowered,
+                            "qbo_candidates_count": len(candidates),
+                            "missing_mer_count": len(missing_mer),
+                            "missing_mer_labels": missing_mer[:10],
+                            "mismatches_count": len(mismatches),
+                            "mismatches": mismatches[:10],
+                            "tolerance": str(amount_match_tolerance),
+                            "note": "MVP book-balance match only; does not prove statement reconciliation. Candidate selection is heuristic (external-statement-like accounts).",
+                        }
+                    ),
                 }
             )
             continue
@@ -557,6 +1022,27 @@ def tool_mer_balance_sheet_review(
                 qbo_amount=qbo_amount,
                 tolerance=amount_match_tolerance,
             )
+            if mer_matches:
+                m = mer_matches[0]
+                delta = (mer_amount - qbo_amount) if mer_amount is not None and qbo_amount is not None else None
+                _add_line_check(
+                    m=m,
+                    rule_id=str(rule_id),
+                    evaluation_type=eval_type,
+                    status="passed" if check.passed else "failed",
+                    note=f"MER={mer_amount} QBO={qbo_amount} Δ={delta}",
+                    evidence={
+                        "mer_a1_cell": m.a1_cell,
+                        "mer_row_key": mer_row_key,
+                        "qbo_label_contains": qbo_label,
+                        "mer_value_raw": m.value,
+                        "mer_amount": str(mer_amount) if mer_amount is not None else None,
+                        "qbo_amount_raw": qbo_amount_raw,
+                        "qbo_amount": str(qbo_amount) if qbo_amount is not None else None,
+                        "tolerance": str(amount_match_tolerance),
+                        "delta": str(delta) if delta is not None else None,
+                    },
+                )
             # Override check_id to the rule_id for reporting consistency
             results.append(
                 {
@@ -596,6 +1082,28 @@ def tool_mer_balance_sheet_review(
                 tolerance=amount_match_tolerance,
             )
 
+            if mer_matches:
+                m = mer_matches[0]
+                delta = (mer_amount - qbo_amount) if mer_amount is not None and qbo_amount is not None else None
+                _add_line_check(
+                    m=m,
+                    rule_id=str(rule_id),
+                    evaluation_type=eval_type,
+                    status="passed" if check.passed else "failed",
+                    note=f"MER={mer_amount} QBO={qbo_amount} Δ={delta}",
+                    evidence={
+                        "mer_a1_cell": m.a1_cell,
+                        "mer_row_key": mer_bank_row_key,
+                        "qbo_label_contains_any": qbo_bank_substring,
+                        "mer_value_raw": m.value,
+                        "mer_amount": str(mer_amount) if mer_amount is not None else None,
+                        "qbo_amount_raw": qbo_amount_raw,
+                        "qbo_amount": str(qbo_amount) if qbo_amount is not None else None,
+                        "tolerance": str(amount_match_tolerance),
+                        "delta": str(delta) if delta is not None else None,
+                    },
+                )
+
             results.append(
                 {
                     "rule_id": rule_id,
@@ -623,6 +1131,21 @@ def tool_mer_balance_sheet_review(
                     aging_report = qbo.get_aged_payables_total(end_date=end_date)
                 except Exception as e:
                     if _qbo_report_permission_denied(e):
+                        mer_matches = find_values_for_rows_containing(
+                            rows=rows,
+                            row_substring="accounts payable",
+                            col_header=selected_month,
+                            header_row_index=header_row_index,
+                        )
+                        for m in mer_matches:
+                            _add_line_check(
+                                m=m,
+                                rule_id=str(rule_id),
+                                evaluation_type=eval_type,
+                                status="skipped",
+                                note="Blocked by QBO report permission (AgedPayables*)",
+                                evidence={"error": str(e)},
+                            )
                         results.append(
                             {
                                 "rule_id": rule_id,
@@ -647,6 +1170,21 @@ def tool_mer_balance_sheet_review(
                     aging_report = qbo.get_aged_receivables_total(end_date=end_date)
                 except Exception as e:
                     if _qbo_report_permission_denied(e):
+                        mer_matches = find_values_for_rows_containing(
+                            rows=rows,
+                            row_substring="accounts receivable",
+                            col_header=selected_month,
+                            header_row_index=header_row_index,
+                        )
+                        for m in mer_matches:
+                            _add_line_check(
+                                m=m,
+                                rule_id=str(rule_id),
+                                evaluation_type=eval_type,
+                                status="skipped",
+                                note="Blocked by QBO report permission (AgedReceivables*)",
+                                evidence={"error": str(e)},
+                            )
                         results.append(
                             {
                                 "rule_id": rule_id,
@@ -679,7 +1217,28 @@ def tool_mer_balance_sheet_review(
             bs_raw = find_first_amount(qbo_items, str(bs_label_substring or ""))
             bs_amount = parse_money(bs_raw)
 
+            mer_matches = []
+            if bs_label_substring:
+                mer_matches = find_values_for_rows_containing(
+                    rows=rows,
+                    row_substring=str(bs_label_substring),
+                    col_header=selected_month,
+                    header_row_index=header_row_index,
+                )
+
             if total_amount is None or bs_amount is None:
+                for m in mer_matches:
+                    _add_line_check(
+                        m=m,
+                        rule_id=str(rule_id),
+                        evaluation_type=eval_type,
+                        status="failed",
+                        note="Could not parse QBO totals",
+                        evidence={
+                            "balance_sheet_amount_raw": bs_raw,
+                            "aging_report_total_raw": total_raw,
+                        },
+                    )
                 results.append(
                     {
                         "rule_id": rule_id,
@@ -699,6 +1258,24 @@ def tool_mer_balance_sheet_review(
 
             delta = total_amount - bs_amount
             passed = abs(delta) <= amount_match_tolerance
+
+            for m in mer_matches:
+                _add_line_check(
+                    m=m,
+                    rule_id=str(rule_id),
+                    evaluation_type=eval_type,
+                    status="passed" if passed else "failed",
+                    note=f"Aging total={total_amount} BS={bs_amount} Δ={delta}",
+                    evidence={
+                        "balance_sheet_label_substring": bs_label_substring,
+                        "balance_sheet_amount_raw": bs_raw,
+                        "balance_sheet_amount": str(bs_amount),
+                        "aging_report_total_raw": total_raw,
+                        "aging_report_total": str(total_amount),
+                        "tolerance": str(amount_match_tolerance),
+                        "delta": str(delta),
+                    },
+                )
             results.append(
                 {
                     "rule_id": rule_id,
@@ -767,6 +1344,31 @@ def tool_mer_balance_sheet_review(
             ar_items = ar.get("items") or []
             has_findings = bool(ap_items) or bool(ar_items)
 
+            # Attach this rule to the AP/AR lines (if present) so it shows up per-line.
+            for label_sub in ["accounts payable", "accounts receivable"]:
+                mer_matches = find_values_for_rows_containing(
+                    rows=rows,
+                    row_substring=label_sub,
+                    col_header=selected_month,
+                    header_row_index=header_row_index,
+                )
+                for m in mer_matches:
+                    _add_line_check(
+                        m=m,
+                        rule_id=str(rule_id),
+                        evaluation_type=eval_type,
+                        status="failed" if has_findings else "passed",
+                        note=f"{len(ap_items)} AP + {len(ar_items)} AR items > {max_age_days_int}d",
+                        evidence={
+                            "period_end_date": end_date,
+                            "max_age_days": max_age_days_int,
+                            "ap_count": len(ap_items),
+                            "ar_count": len(ar_items),
+                            "ap_total_over_threshold": ap.get("total_over_threshold"),
+                            "ar_total_over_threshold": ar.get("total_over_threshold"),
+                        },
+                    )
+
             results.append(
                 {
                     "rule_id": rule_id,
@@ -796,6 +1398,74 @@ def tool_mer_balance_sheet_review(
                 }
             )
             continue
+
+    # Build per-line results (for JSON artifacts + optional sheet annotations).
+    line_results: list[dict] = []
+    for row_index, entry in sorted(line_results_by_row.items(), key=lambda kv: kv[0]):
+        check_statuses = [str(c.get("status")) for c in (entry.get("checks") or [])]
+        overall = _overall_line_status(check_statuses)
+        entry["overall_status"] = overall
+        entry["sheet_annotation"] = _summarize_for_cell(overall=overall, checks=entry.get("checks") or [])
+        line_results.append(entry)
+
+    artifacts_dir = os.environ.get("MER_AGENT_ARTIFACTS_DIR", ".mer_agent_runs")
+    write_line_json = os.environ.get("MER_AGENT_WRITE_LINE_RESULTS_JSON", "").strip() == "1"
+    line_json_path: str | None = None
+    if write_line_json:
+        from datetime import datetime, timezone
+
+        ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        line_json_path = _write_json_artifact(
+            out_dir=artifacts_dir,
+            filename=f"{ts}_mer_line_results.json",
+            payload={
+                "period_end_date": end_date,
+                "mer": {"sheet": sheet, "range": mer_range, "selected_month_header": selected_month},
+                "line_results": line_results,
+            },
+        )
+
+    # Optional: write annotations to the configured column (default: P).
+    wrote_sheet_annotations: dict | None = None
+    if os.environ.get("MER_AGENT_WRITE_SHEET_ANNOTATIONS", "").strip() == "1":
+        if header_row_index is None:
+            raise ValueError("Cannot write sheet annotations without a detected header_row_index")
+
+        def _a1_col_to_index(col_letters: str) -> int:
+            col_letters = (col_letters or "").strip().upper()
+            if not col_letters or not re.fullmatch(r"[A-Z]{1,3}", col_letters):
+                raise ValueError(f"Invalid A1 column letters: {col_letters!r}")
+            n = 0
+            for ch in col_letters:
+                n = n * 26 + (ord(ch) - ord("A") + 1)
+            return n - 1
+
+        header_row_num = header_row_index + 1
+        annotation_col_letter = os.environ.get("MER_AGENT_SHEET_ANNOTATION_COLUMN", "H").strip().upper() or "H"
+        annotation_col_index = _a1_col_to_index(annotation_col_letter)
+        header_value = os.environ.get(
+            "MER_AGENT_SHEET_ANNOTATION_HEADER",
+            f"MER Review (auto) {end_date}",
+        )
+
+        updates: dict[str, str] = {f"'{sheet}'!{annotation_col_letter}{header_row_num}": header_value}
+        for lr in line_results:
+            text = (lr.get("sheet_annotation") or "").strip()
+            if not text:
+                continue
+            mer_row_index = int(((lr.get("mer") or {}).get("row_index")) or -1)
+            if mer_row_index < 0:
+                continue
+            row_num = mer_row_index + 1
+            updates[f"'{sheet}'!{annotation_col_letter}{row_num}"] = text
+
+        # Guarded inside the integration by GOOGLE_SHEETS_ALLOW_WRITE=1.
+        wrote_sheet_annotations = {
+            "annotation_col_letter": annotation_col_letter,
+            "annotation_col_index": annotation_col_index,
+            "updated_cells": len(updates),
+            "response": reader.batch_update_values(updates=updates),
+        }
 
     # Compact the payload: keep summary + failed evidence, omit huge unimplemented list.
     passed = sum(1 for r in results if r.get("status") == "passed")
@@ -864,6 +1534,11 @@ def tool_mer_balance_sheet_review(
         "failed": failed_results,
         "skipped": skipped_results,
         "implemented": implemented_results,
+        "line_results": line_results,
+        "artifacts": {
+            "line_results_json": line_json_path,
+            "sheet_write": wrote_sheet_annotations,
+        },
         "action_items": _collect_action_items(rulebook),
     }
 
@@ -893,8 +1568,9 @@ def tool_mer_balance_sheet_entries(
     sheet = mer_sheet
     if not sheet:
         titles = reader.list_sheet_titles()
-        if "Balance Sheet" in titles:
-            sheet = "Balance Sheet"
+        title_map = {str(t or "").strip().lower(): t for t in titles}
+        if "balance sheet" in title_map:
+            sheet = title_map["balance sheet"]
         else:
             raise ValueError(f"mer_sheet is required. Available sheets: {titles}")
 
@@ -1015,7 +1691,7 @@ def _make_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "mer_balance_sheet_review",
-                "description": "Run deterministic MER Balance Sheet review checks (reads Google Sheet + QBO; never writes).",
+                "description": "Run deterministic MER Balance Sheet review checks (reads Google Sheet + QBO; optionally writes artifacts/annotations when explicitly enabled via env vars).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1046,6 +1722,18 @@ def _run_tool(name: str, args: dict) -> dict:
 async def run_agent(prompt: str, max_steps: int) -> str:
     _load_azd_env_into_process()
 
+    emit_run_log = os.environ.get("MER_AGENT_EMIT_RUN_LOG", "0") == "1"
+    run_t0 = time.perf_counter()
+    run_log: dict[str, Any] = {
+        "config": {},
+        "run started": _utc_now_iso(),
+        "run ended": None,
+        "time taken seconds": None,
+        "attempts": [],
+        "final rulebook checks": None,
+        "final answer": None,
+    }
+
     verbose = os.environ.get("MER_AGENT_VERBOSE", "0") == "1"
 
     def _log(msg: str) -> None:
@@ -1059,6 +1747,7 @@ async def run_agent(prompt: str, max_steps: int) -> str:
     bullet_count = _requested_bullet_count(prompt) or (5 if wants_5_only else 5)
 
     if tool_only or _explicit_tool_directive(prompt, "mer_balance_sheet_review"):
+        t0 = time.perf_counter()
         end_date = _normalize_date_from_text(prompt)
         if not end_date:
             return "- Missing end_date (YYYY-MM-DD)"
@@ -1068,17 +1757,87 @@ async def run_agent(prompt: str, max_steps: int) -> str:
         want_full_json = want_full_json or ("print the full tool result" in prompt.lower())
 
         bullets = _format_mer_review_bullets(result, bullets=bullet_count)
-        if not want_full_json:
-            return bullets
+        duration_s = round(time.perf_counter() - t0, 3)
 
-        payload = json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True)
-        return payload + "\n\n" + bullets
+        if emit_run_log:
+            run_log["config"] = _redact_config(
+                {
+                    "mode": "tool_only",
+                    "prompt": prompt,
+                    "max_steps": max_steps,
+                    "tool_only": True,
+                    "deterministic_after_tools": True,
+                    "print_tool_json": bool(want_full_json),
+                }
+            )
+            run_log["attempts"].append(
+                {
+                    "attempt number": 1,
+                    "start_time": run_log["run started"],
+                    "end_time": _utc_now_iso(),
+                    "time taken seconds": duration_s,
+                    "model used": None,
+                    "input tokens": None,
+                    "output tokens": None,
+                    "cached tokens": None,
+                    "warnings": [],
+                    "tool_calls": [
+                        {
+                            "tool": "mer_balance_sheet_review",
+                            "args": {"end_date": end_date},
+                            "duration seconds": duration_s,
+                            "error": None,
+                            "result": result,
+                        }
+                    ],
+                    "rulebook checks": {
+                        "implemented": result.get("implemented"),
+                        "failed": result.get("failed"),
+                        "skipped": result.get("skipped"),
+                        "summary": result.get("summary"),
+                    },
+                }
+            )
+            run_log["final rulebook checks"] = run_log["attempts"][0]["rulebook checks"]
+            run_log["final answer"] = bullets
+            run_log["run ended"] = _utc_now_iso()
+            run_log["time taken seconds"] = round(time.perf_counter() - run_t0, 3)
+            return json.dumps(run_log, indent=2, ensure_ascii=False)
+
+        if want_full_json:
+            payload = json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True)
+            return payload + "\n\n" + bullets
+
+        return bullets
 
     endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
     deployment = os.environ.get("MER_AGENT_LLM_DEPLOYMENT") or os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME")
     api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-11-20")
     auth_mode = os.environ.get("MER_AGENT_AUTH", "aad").lower().strip()
     api_key = os.environ.get("AZURE_OPENAI_API_KEY")
+
+    run_log["config"] = _redact_config(
+        {
+            "mode": "llm_agent",
+            "prompt": prompt,
+            "max_steps": max_steps,
+            "azure_openai_endpoint": endpoint,
+            "azure_openai_deployment": deployment,
+            "azure_openai_api_version": api_version,
+            "mer_agent_auth": auth_mode,
+            "azure_openai_api_key": api_key,
+            "deterministic_after_tools": os.environ.get("MER_AGENT_DETERMINISTIC_AFTER_TOOLS", "1") == "1",
+            "tool_only": tool_only,
+            "limits": {
+                "MER_AGENT_QBO_PREVIEW_LIMIT": os.environ.get("MER_AGENT_QBO_PREVIEW_LIMIT"),
+                "MER_AGENT_EVIDENCE_LIST_LIMIT": os.environ.get("MER_AGENT_EVIDENCE_LIST_LIMIT"),
+                "MER_AGENT_EVIDENCE_STRING_LIMIT": os.environ.get("MER_AGENT_EVIDENCE_STRING_LIMIT"),
+                "MER_AGENT_FAILED_RULES_LIMIT": os.environ.get("MER_AGENT_FAILED_RULES_LIMIT"),
+                "MER_AGENT_IMPLEMENTED_RULES_LIMIT": os.environ.get("MER_AGENT_IMPLEMENTED_RULES_LIMIT"),
+                "MER_AGENT_ACTION_ITEMS_LIMIT": os.environ.get("MER_AGENT_ACTION_ITEMS_LIMIT"),
+            },
+        }
+    )
 
     if not endpoint or not deployment:
         raise RuntimeError(
@@ -1169,6 +1928,9 @@ async def run_agent(prompt: str, max_steps: int) -> str:
 
     last_tool_results: list[dict] = []
 
+    attempt_seq = 0
+    step_seq = 0
+
     def _fallback_summary(reason: str) -> str:
         # Only supports our current two tools; keep it compact.
         mer = next((r for r in last_tool_results if r.get("tool") == "mer_balance_sheet_review"), None)
@@ -1213,12 +1975,39 @@ async def run_agent(prompt: str, max_steps: int) -> str:
 
         return "\n".join(lines)
 
-    def _chat_with_retries() -> Any:
+    def _extract_usage(resp_obj: Any) -> dict[str, Any]:
+        usage = getattr(resp_obj, "usage", None)
+        if not usage:
+            return {"input_tokens": None, "output_tokens": None, "cached_tokens": None}
+
+        input_tokens = getattr(usage, "prompt_tokens", None)
+        output_tokens = getattr(usage, "completion_tokens", None)
+
+        cached_tokens = None
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details is not None:
+            cached_tokens = getattr(details, "cached_tokens", None)
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_tokens": cached_tokens,
+        }
+
+    def _chat_with_retries(*, step_index: int) -> Any:
         # Keep retries short and explicit; Azure often tells you a wait time.
         max_attempts = int(os.environ.get("MER_AGENT_LLM_MAX_RETRIES", "4"))
         base_sleep = float(os.environ.get("MER_AGENT_LLM_RETRY_SLEEP_SECONDS", "75"))
         max_tokens = int(os.environ.get("MER_AGENT_LLM_MAX_TOKENS", "400"))
         http_timeout = float(os.environ.get("MER_AGENT_HTTP_TIMEOUT_SECONDS", "30"))
+
+        respect_retry_after = os.environ.get("MER_AGENT_RESPECT_RETRY_AFTER", "1") == "1"
+        retry_after_cap = os.environ.get("MER_AGENT_RETRY_AFTER_CAP_SECONDS")
+        retry_after_cap_s: float | None = None
+        if retry_after_cap is not None and str(retry_after_cap).strip() != "":
+            try:
+                retry_after_cap_s = float(retry_after_cap)
+            except Exception:
+                retry_after_cap_s = None
 
         def _retry_after_seconds(err: Exception) -> Optional[float]:
             # Azure OpenAI usually embeds: "Please retry after 60 seconds."
@@ -1231,15 +2020,33 @@ async def run_agent(prompt: str, max_steps: int) -> str:
                     return None
             return None
 
-        for attempt in range(1, max_attempts + 1):
+        nonlocal attempt_seq
+        for retry_index in range(1, max_attempts + 1):
+            attempt_seq += 1
+            attempt_log: dict[str, Any] = {
+                "attempt number": attempt_seq,
+                "step_index": step_index,
+                "retry_index": retry_index,
+                "start_time": _utc_now_iso(),
+                "end_time": None,
+                "time taken seconds": None,
+                "model used": deployment,
+                "input tokens": None,
+                "output tokens": None,
+                "cached tokens": None,
+                "warnings": [],
+                "tool_calls": [],
+                "rulebook checks": None,
+            }
+            t0 = time.perf_counter()
             try:
                 _log("calling Azure OpenAI...")
-                print(f"[llm] request (attempt {attempt}/{max_attempts})", file=sys.stderr)
+                print(f"[llm] request (attempt {retry_index}/{max_attempts})", file=sys.stderr)
                 # The OpenAI SDK provides precise type hints for messages/tools; in this script
                 # we build them dynamically as plain dicts.
                 messages_any: Any = messages
                 tools_any: Any = tools
-                return client.chat.completions.create(
+                resp_obj = client.chat.completions.create(
                     model=deployment,
                     messages=messages_any,
                     tools=tools_any,
@@ -1248,26 +2055,75 @@ async def run_agent(prompt: str, max_steps: int) -> str:
                     max_tokens=max_tokens,
                     timeout=http_timeout,
                 )
+                usage_out = _extract_usage(resp_obj)
+                attempt_log.update(
+                    {
+                        "input tokens": usage_out.get("input_tokens"),
+                        "output tokens": usage_out.get("output_tokens"),
+                        "cached tokens": usage_out.get("cached_tokens"),
+                    }
+                )
+                return resp_obj
             except RateLimitError as e:
-                if attempt >= max_attempts:
+                attempt_log["warnings"].append(
+                    {
+                        "type": "rate_limit",
+                        "message": str(e),
+                    }
+                )
+                if retry_index >= max_attempts:
                     raise
                 ra = _retry_after_seconds(e)
+                if not respect_retry_after:
+                    ra = None
+                elif retry_after_cap_s is not None and ra is not None:
+                    ra = min(ra, retry_after_cap_s)
                 # Exponential backoff + jitter. If Azure provides retry-after, respect it.
-                exp = base_sleep * (2 ** max(attempt - 1, 0))
+                exp = base_sleep * (2 ** max(retry_index - 1, 0))
                 sleep_s = max((ra or 0) + 1, exp) + random.uniform(0, 3)
                 print(
-                    f"[llm] rate limited; retrying in {sleep_s:.0f}s (attempt {attempt}/{max_attempts})",
+                    f"[llm] rate limited; retrying in {sleep_s:.0f}s (attempt {retry_index}/{max_attempts})",
                     file=sys.stderr,
                 )
+                attempt_log["warnings"].append(
+                    {
+                        "type": "retry_sleep",
+                        "sleep_seconds": sleep_s,
+                        "retry_after_seconds": ra,
+                    }
+                )
                 time.sleep(sleep_s)
+            finally:
+                attempt_log["end_time"] = _utc_now_iso()
+                attempt_log["time taken seconds"] = round(time.perf_counter() - t0, 3)
+                run_log["attempts"].append(attempt_log)
 
     for _ in range(max_steps):
+        step_seq += 1
         try:
-            resp = _chat_with_retries()
+            resp = _chat_with_retries(step_index=step_seq)
         except RateLimitError:
             # If we already have tool results, return deterministic summary.
             if last_tool_results:
-                return _fallback_summary("LLM summarization skipped due to Azure OpenAI rate limiting; showing deterministic summary")
+                final_text = _fallback_summary(
+                    "LLM summarization skipped due to Azure OpenAI rate limiting; showing deterministic summary"
+                )
+                run_log["final answer"] = final_text
+
+                mer_res = next((r for r in last_tool_results if r.get("tool") == "mer_balance_sheet_review"), None)
+                if mer_res and isinstance(mer_res.get("result"), dict):
+                    run_log["final rulebook checks"] = {
+                        "implemented": mer_res["result"].get("implemented"),
+                        "failed": mer_res["result"].get("failed"),
+                        "skipped": mer_res["result"].get("skipped"),
+                        "summary": mer_res["result"].get("summary"),
+                    }
+
+                run_log["run ended"] = _utc_now_iso()
+                run_log["time taken seconds"] = round(time.perf_counter() - run_t0, 3)
+                if emit_run_log:
+                    return json.dumps(run_log, indent=2, ensure_ascii=False)
+                return final_text
             # If the user asked for an explicit deterministic tool call, try that.
             if _explicit_tool_directive(prompt, "mer_balance_sheet_review"):
                 end_date = _normalize_date_from_text(prompt)
@@ -1296,8 +2152,41 @@ async def run_agent(prompt: str, max_steps: int) -> str:
                         args["end_date"] = recovered
 
                 _log(f"running tool {name}...")
-                result = _run_tool(name, args)
-                last_tool_results.append({"tool": name, "args": args, "result": result})
+                tool_t0 = time.perf_counter()
+                try:
+                    result = _run_tool(name, args)
+                    tool_err = None
+                except Exception as tool_exc:
+                    result = None
+                    tool_err = str(tool_exc)
+                tool_dt = round(time.perf_counter() - tool_t0, 3)
+
+                last_tool_results.append({"tool": name, "args": args, "result": result, "error": tool_err, "duration_seconds": tool_dt})
+
+                # Attach tool call info to the latest attempt record.
+                if run_log["attempts"]:
+                    run_log["attempts"][-1].setdefault("tool_calls", []).append(
+                        {
+                            "tool": name,
+                            "args": args,
+                            "duration seconds": tool_dt,
+                            "error": tool_err,
+                            "result": result,
+                        }
+                    )
+
+                    # If this tool produced rulebook check output, attach it to the current attempt.
+                    if name == "mer_balance_sheet_review" and isinstance(result, dict):
+                        run_log["attempts"][-1]["rulebook checks"] = {
+                            "implemented": result.get("implemented"),
+                            "failed": result.get("failed"),
+                            "skipped": result.get("skipped"),
+                            "summary": result.get("summary"),
+                        }
+
+                if tool_err is not None:
+                    # Bubble up tool failure to the LLM loop to avoid silently continuing.
+                    raise RuntimeError(f"Tool '{name}' failed: {tool_err}")
                 messages.append(
                     {
                         "role": "tool",
@@ -1314,15 +2203,53 @@ async def run_agent(prompt: str, max_steps: int) -> str:
                 bullets = requested or (5 if _wants_only_five_bullets(prompt) else 5)
                 mer_res = next((r for r in last_tool_results if r.get("tool") == "mer_balance_sheet_review"), None)
                 if mer_res and isinstance(mer_res.get("result"), dict):
-                    return _format_mer_review_bullets(mer_res["result"], bullets=bullets)
-                return _format_generic_tool_bullets(last_tool_results, bullets=bullets)
+                    if _wants_detailed_failures(prompt):
+                        final_text = _format_mer_review_detailed(mer_res["result"])
+                    else:
+                        final_text = _format_mer_review_bullets(mer_res["result"], bullets=bullets)
+                    run_log["final rulebook checks"] = {
+                        "implemented": mer_res["result"].get("implemented"),
+                        "failed": mer_res["result"].get("failed"),
+                        "skipped": mer_res["result"].get("skipped"),
+                        "summary": mer_res["result"].get("summary"),
+                    }
+                else:
+                    final_text = _format_generic_tool_bullets(last_tool_results, bullets=bullets)
+
+                run_log["final answer"] = final_text
+                run_log["run ended"] = _utc_now_iso()
+                run_log["time taken seconds"] = round(time.perf_counter() - run_t0, 3)
+                if emit_run_log:
+                    return json.dumps(run_log, indent=2, ensure_ascii=False)
+                return final_text
 
             continue
 
         # Final answer
-        return msg.content or ""
+        final = msg.content or ""
+        run_log["final answer"] = final
+        run_log["run ended"] = _utc_now_iso()
+        run_log["time taken seconds"] = round(time.perf_counter() - run_t0, 3)
+        if emit_run_log:
+            # Best-effort: if a deterministic review was run, capture rulebook checks for debugging.
+            mer_res = next((r for r in last_tool_results if r.get("tool") == "mer_balance_sheet_review"), None)
+            if mer_res and isinstance(mer_res.get("result"), dict):
+                run_log["final rulebook checks"] = {
+                    "implemented": mer_res["result"].get("implemented"),
+                    "failed": mer_res["result"].get("failed"),
+                    "skipped": mer_res["result"].get("skipped"),
+                    "summary": mer_res["result"].get("summary"),
+                }
+            return json.dumps(run_log, indent=2, ensure_ascii=False)
+        return final
 
-    return "Agent did not finish within max_steps. Try a more specific prompt."
+    final = "Agent did not finish within max_steps. Try a more specific prompt."
+    run_log["final answer"] = final
+    run_log["run ended"] = _utc_now_iso()
+    run_log["time taken seconds"] = round(time.perf_counter() - run_t0, 3)
+    if emit_run_log:
+        return json.dumps(run_log, indent=2, ensure_ascii=False)
+    return final
 
 
 def main() -> int:

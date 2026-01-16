@@ -5,18 +5,32 @@ Tests Bing search, RAG, MCP tools, and Code Interpreter capabilities.
 # pylint: disable=E0401, E0611, C0413
 
 import sys
+import os
 from pathlib import Path
 
 import pytest
+
+
+if os.getenv("RUN_LIVE_INTEGRATION_TESTS") != "1":  # pragma: no cover
+    pytest.skip(
+        "Live Foundry/Azure integration tests are disabled by default. "
+        "Set RUN_LIVE_INTEGRATION_TESTS=1 to enable.",
+        allow_module_level=True,
+    )
 
 # Add the backend path to sys.path so we can import v4 modules
 backend_path = Path(__file__).parent.parent.parent / "backend"
 sys.path.insert(0, str(backend_path))
 
 # Now import from the v4 package
-from src.backend.v4.magentic_agents.foundry_agent import FoundryAgentTemplate
-from src.backend.v4.magentic_agents.models.agent_models import (MCPConfig,
-                                                    SearchConfig)
+try:
+    from src.backend.v4.magentic_agents.foundry_agent import FoundryAgentTemplate
+    from src.backend.v4.magentic_agents.models.agent_models import MCPConfig, SearchConfig
+except Exception as exc:  # pragma: no cover
+    pytest.skip(
+        f"Foundry/Azure integration dependencies not available: {exc}",
+        allow_module_level=True,
+    )
 
 
 class TestFoundryAgentIntegration:

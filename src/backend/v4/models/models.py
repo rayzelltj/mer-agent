@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 class PlanStatus(str, Enum):
     CREATED = "created"
+    PENDING_APPROVAL = "pending_approval"
     QUEUED = "queued"
     RUNNING = "running"
     COMPLETED = "completed"

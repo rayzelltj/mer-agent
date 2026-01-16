@@ -3,7 +3,7 @@ Product MCP tools service.
 """
 
 
-from core.factory import Domain, MCPToolBase
+from ..core.factory import Domain, MCPToolBase
 
 class ProductService(MCPToolBase):
     """Product tools for employee onboarding and management."""

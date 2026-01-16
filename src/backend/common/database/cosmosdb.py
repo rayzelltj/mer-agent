@@ -4,7 +4,7 @@ import datetime
 import logging
 from typing import Any, Dict, List, Optional, Type
 
-import v4.models.messages as messages
+from src.backend.v4.models import messages as messages
 from azure.cosmos.aio import CosmosClient
 from azure.cosmos.aio._database import DatabaseProxy
 

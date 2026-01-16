@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 
-from common.models.messages_af import AgentMessageType
-from v4.models.models import MPlan, PlanStatus
+from src.backend.common.models.messages_af import AgentMessageType
+from src.backend.v4.models.models import MPlan, PlanStatus
 
 
 # ---------------------------------------------------------------------------

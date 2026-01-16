@@ -278,24 +278,24 @@ class QBOClient:
         try:
             return self._get_report(
                 report_name="AgedPayablesDetail",
-                params={"report_date": end_date},
+                params={"end_date": end_date},
             )
         except RuntimeError:
             return self._get_report(
                 report_name="AgedPayables",
-                params={"report_date": end_date},
+                params={"end_date": end_date},
             )
 
     def get_aged_receivables_detail(self, *, end_date: str) -> dict[str, Any]:
         try:
             return self._get_report(
                 report_name="AgedReceivablesDetail",
-                params={"report_date": end_date},
+                params={"end_date": end_date},
             )
         except RuntimeError:
             return self._get_report(
                 report_name="AgedReceivables",
-                params={"report_date": end_date},
+                params={"end_date": end_date},
             )
 
     def get_aged_payables_total(

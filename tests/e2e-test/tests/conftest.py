@@ -8,7 +8,13 @@ import atexit
 from datetime import datetime
 
 import pytest
-from playwright.sync_api import sync_playwright
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:  # pragma: no cover
+    pytest.skip(
+        "Playwright is not installed; skipping e2e tests.",
+        allow_module_level=True,
+    )
 from bs4 import BeautifulSoup
 
 from config.constants import URL

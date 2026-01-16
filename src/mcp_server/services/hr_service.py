@@ -3,9 +3,9 @@ Human Resources MCP tools service.
 """
 
 
-from core.factory import Domain, MCPToolBase
-from utils.date_utils import format_date_for_user
-from utils.formatters import format_error_response, format_success_response
+from ..core.factory import Domain, MCPToolBase
+from ..utils.date_utils import format_date_for_user
+from ..utils.formatters import format_error_response, format_success_response
 
 
 class HRService(MCPToolBase):
@@ -16,124 +16,6 @@ class HRService(MCPToolBase):
 
     def register_tools(self, mcp) -> None:
         """Register HR tools with the MCP server."""
-
-        @mcp.tool(tags={self.domain.value})
-        async def employee_onboarding_blueprint_flat(
-            employee_name: str | None = None,
-            start_date: str | None = None,
-            role: str | None = None
-        ) -> dict:
-            """
-            Ultra-minimal onboarding blueprint (flat list).
-            Agent usage:
-            1. Call this first when onboarding intent detected.
-            2. Filter steps to its own domain.
-            3. Execute in listed order while honoring depends_on.
-            """
-            return {
-                "version": "1.0",
-                "intent": "employee_onboarding",
-                "employee": {
-                    "name": employee_name,
-                    "start_date": start_date,
-                    "role": role
-                },
-                "steps": [
-                    # Pre-boarding
-                    {
-                        "id": "bg_check",
-                        "domain": "HR",
-                        "action": "Initiate background check",
-                        "tool": "initiate_background_check",
-                        "required": True,
-                        "params": ["employee_name", "check_type?"]
-                    },
-                    {
-                        "id": "configure_laptop",
-                        "domain": "TECH_SUPPORT",
-                        "action": "Provision and configure laptop",
-                        "tool": "configure_laptop",
-                        "required": True
-                    },
-                    {
-                        "id": "create_accounts",
-                        "domain": "TECH_SUPPORT",
-                        "action": "Create system accounts",
-                        "tool": "create_system_accounts",
-                        "required": True
-                    },
-
-                    # Day 1
-                    {
-                        "id": "orientation",
-                        "domain": "HR",
-                        "action": "Schedule orientation session",
-                        "tool": "schedule_orientation_session",
-                        "required": True,
-                        "depends_on": ["bg_check"],
-                        "params": ["employee_name", "date"]
-                    },
-                    {
-                        "id": "handbook",
-                        "domain": "HR",
-                        "action": "Provide employee handbook",
-                        "tool": "provide_employee_handbook",
-                        "required": True,
-                        "params": ["employee_name"]
-                    },
-                    {
-                        "id": "welcome_email",
-                        "domain": "TECH_SUPPORT",
-                        "action": "Send welcome email",
-                        "tool": "send_welcome_email",
-                        "required": False,
-                        "depends_on": ["create_accounts"]
-                    },
-
-                    # Week 1
-                    {
-                        "id": "mentor",
-                        "domain": "HR",
-                        "action": "Assign mentor",
-                        "tool": "assign_mentor",
-                        "required": False,
-                        "params": ["employee_name", "mentor_name?"]
-                    },
-                    {
-                        "id": "vpn",
-                        "domain": "TECH_SUPPORT",
-                        "action": "Set up VPN access",
-                        "tool": "setup_vpn_access",
-                        "required": False,
-                        "depends_on": ["create_accounts"]
-                    },
-                    {
-                        "id": "benefits",
-                        "domain": "HR",
-                        "action": "Register employee for benefits",
-                        "tool": "register_for_benefits",
-                        "required": True,
-                        "params": ["employee_name", "benefits_package?"]
-                    },
-                    {
-                        "id": "payroll",
-                        "domain": "HR",
-                        "action": "Set up payroll",
-                        "tool": "set_up_payroll",
-                        "required": True,
-                        "params": ["employee_name", "salary?"]
-                    },
-                    {
-                        "id": "id_card",
-                        "domain": "HR",
-                        "action": "Request ID card",
-                        "tool": "request_id_card",
-                        "required": False,
-                        "depends_on": ["bg_check"],
-                        "params": ["employee_name", "department?"]
-                    }
-                ]
-            }
         @mcp.tool(tags={self.domain.value})
         async def schedule_orientation_session(employee_name: str, date: str) -> str:
             """Schedule an orientation session for a new employee."""

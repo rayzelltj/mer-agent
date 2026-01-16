@@ -57,9 +57,12 @@ Before starting, ensure you have:
    - **Client Secret**: Click "Show" and copy this (you'll need it later)
 
 4. Scroll down to **"Redirect URIs"** section
-5. Click **"Add URI"** and add your callback URL:
-   - For local development: `http://localhost:8000/api/v4/quickbooks/callback`
-   - For production: `https://yourdomain.com/api/v4/quickbooks/callback`
+5. Click **"Add URI"** and add your callback URL.
+
+  This repo’s local OAuth helper script (`scripts/qbo_auth_local.py`) starts a tiny local HTTP server and expects a redirect URI that includes a host + port + path.
+
+  - For local development (recommended): `http://localhost:8040/qbo/callback`
+  - If you use a public tunnel (e.g., ngrok) you can set `QBO_REDIRECT_URI` to the public HTTPS URL and set `QBO_LOCAL_REDIRECT_URI` to a localhost listener.
 
    ⚠️ **IMPORTANT**: The redirect URI must match EXACTLY what you use in your code, including:
    - Protocol (http vs https)
@@ -106,23 +109,25 @@ New-Item .env  # Windows PowerShell
 
 ### 2.2 Add QuickBooks Configuration
 
-Open your `.env` file and add the following variables:
+Open your `.env` file and add the following variables (these names match the code in `src/backend/v4/integrations/qbo_client.py` and `scripts/qbo_auth_local.py`):
 
 ```bash
-# QuickBooks Online Configuration
-QB_CLIENT_ID=your_client_id_here
-QB_CLIENT_SECRET=your_client_secret_here
-QB_REDIRECT_URI=http://localhost:8000/api/v4/quickbooks/callback
-QB_ENVIRONMENT=sandbox
-QB_SCOPE=com.intuit.quickbooks.accounting
+# QuickBooks Online (QBO) Configuration
+QBO_CLIENT_ID=your_client_id_here
+QBO_CLIENT_SECRET=your_client_secret_here
+QBO_REDIRECT_URI=http://localhost:8040/qbo/callback
+QBO_ENVIRONMENT=sandbox
+
+# Where the local OAuth script writes tokens (gitignored)
+QBO_TOKENS_PATH=./.env_qbo_tokens.json
 ```
 
 **Replace the values:**
-- `QB_CLIENT_ID`: Paste your Client ID from Step 1.3
-- `QB_CLIENT_SECRET`: Paste your Client Secret from Step 1.3
-- `QB_REDIRECT_URI`: Must match exactly what you set in the Intuit Developer Portal (Step 1.3)
-- `QB_ENVIRONMENT`: Use `sandbox` for testing, `production` for live data
-- `QB_SCOPE`: Keep as shown (this is the accounting scope)
+- `QBO_CLIENT_ID`: Paste your Client ID from Step 1.3
+- `QBO_CLIENT_SECRET`: Paste your Client Secret from Step 1.3
+- `QBO_REDIRECT_URI`: Must match exactly what you set in the Intuit Developer Portal (Step 1.3)
+- `QBO_ENVIRONMENT`: Use `sandbox` for testing, `production` for live data
+- `QBO_TOKENS_PATH`: Optional path for saving tokens (default is `./.env_qbo_tokens.json`)
 
 ### 2.3 Example .env File
 
@@ -134,12 +139,12 @@ AZURE_OPENAI_ENDPOINT=https://your-endpoint.openai.azure.com/
 AZURE_OPENAI_DEPLOYMENT_NAME=gpt-4
 # ... other existing vars ...
 
-# QuickBooks Online Configuration
-QB_CLIENT_ID=ABcdEFgh1234567890iJkLmNoPqRsTuVwXyZ
-QB_CLIENT_SECRET=1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p7q8r9s0t
-QB_REDIRECT_URI=http://localhost:8000/api/v4/quickbooks/callback
-QB_ENVIRONMENT=sandbox
-QB_SCOPE=com.intuit.quickbooks.accounting
+# QuickBooks Online (QBO) Configuration
+QBO_CLIENT_ID=ABcdEFgh1234567890iJkLmNoPqRsTuVwXyZ
+QBO_CLIENT_SECRET=1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p7q8r9s0t
+QBO_REDIRECT_URI=http://localhost:8040/qbo/callback
+QBO_ENVIRONMENT=sandbox
+QBO_TOKENS_PATH=./.env_qbo_tokens.json
 ```
 
 ⚠️ **Security Note**: Never commit your `.env` file to Git! It should already be in `.gitignore`.
@@ -266,6 +271,14 @@ Here's how the QuickBooks OAuth 2.0 flow works:
 ---
 
 ## Step 5: Testing the Integration
+
+After your env vars are set, run the local OAuth helper to generate tokens:
+
+```bash
+python scripts/qbo_auth_local.py
+```
+
+This writes a token file (default `./.env_qbo_tokens.json`). After that, you can call QBO read-only APIs.
 
 ### 5.1 Start Your Backend Server
 
@@ -462,7 +475,7 @@ for mer_account in mer_accounts:
 
 **Solution**:
 1. Check that your `.env` file exists in `src/backend/`
-2. Verify all `QB_*` variables are set correctly
+2. Verify all `QBO_*` variables are set correctly
 3. Restart your backend server after changing `.env`
 4. Check for typos in variable names (they're case-sensitive)
 
@@ -473,7 +486,7 @@ for mer_account in mer_accounts:
 **Solution**:
 1. Go to Intuit Developer Portal → Your App → Keys & OAuth
 2. Check the exact redirect URI registered (including protocol, port, path)
-3. Make sure `QB_REDIRECT_URI` in your `.env` matches EXACTLY
+3. Make sure `QBO_REDIRECT_URI` in your `.env` matches EXACTLY
 4. Common mistakes:
    - `http` vs `https`
    - Missing port number (`:8000`)

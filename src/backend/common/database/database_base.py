@@ -6,7 +6,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Type
 
-import v4.models.messages as messages
+from src.backend.v4.models import messages as messages
 
 from ..models.messages_af import (
     AgentMessageData,

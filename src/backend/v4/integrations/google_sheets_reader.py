@@ -241,7 +241,7 @@ class GoogleSheetsReader:
             timeout_seconds=timeout_seconds,
         )
 
-    def _build_sheets_service(self) -> Any:
+    def _build_sheets_service(self, *, readonly: bool = True) -> Any:
         # Lazy import so unit tests that only use the deterministic helpers
         # do not require Google client libs.
         from google.oauth2 import service_account
@@ -253,9 +253,14 @@ class GoogleSheetsReader:
             )
 
         sa = json.load(open(self._service_account_path, "r", encoding="utf-8"))
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets.readonly"
+            if readonly
+            else "https://www.googleapis.com/auth/spreadsheets"
+        ]
         creds = service_account.Credentials.from_service_account_info(
             sa,
-            scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+            scopes=scopes,
         )
 
         return build(
@@ -270,7 +275,7 @@ class GoogleSheetsReader:
         return self._spreadsheet_id
 
     def list_sheet_titles(self) -> list[str]:
-        sheets = self._build_sheets_service()
+        sheets = self._build_sheets_service(readonly=True)
         meta = (
             sheets.spreadsheets()
             .get(spreadsheetId=self._spreadsheet_id, fields="sheets(properties(title))")
@@ -279,7 +284,7 @@ class GoogleSheetsReader:
         return [s["properties"]["title"] for s in meta.get("sheets", [])]
 
     def fetch_rows(self, *, a1_range: str) -> list[list[str]]:
-        sheets = self._build_sheets_service()
+        sheets = self._build_sheets_service(readonly=True)
         resp = (
             sheets.spreadsheets()
             .values()
@@ -288,3 +293,40 @@ class GoogleSheetsReader:
         )
         rows = resp.get("values", [])
         return rows if isinstance(rows, list) else []
+
+    def batch_update_values(self, *, updates: dict[str, str]) -> dict[str, Any]:
+        """Update many individual cells with a single API call.
+
+        `updates` is an A1-range -> value mapping, e.g.:
+        {
+          "'Balance Sheet'!AA12": "PASS",
+          "'Balance Sheet'!AA13": "FAIL: ...",
+        }
+
+        Safety: writing is disabled unless GOOGLE_SHEETS_ALLOW_WRITE=1.
+        """
+
+        if os.environ.get("GOOGLE_SHEETS_ALLOW_WRITE", "").strip() != "1":
+            raise PermissionError(
+                "Google Sheets write disabled. Set GOOGLE_SHEETS_ALLOW_WRITE=1 to enable updates."
+            )
+
+        if not updates:
+            return {"updated": 0}
+
+        sheets = self._build_sheets_service(readonly=False)
+
+        data = [
+            {"range": a1_range, "values": [[value]]}
+            for a1_range, value in updates.items()
+            if a1_range and value is not None
+        ]
+        body: dict[str, Any] = {"valueInputOption": "USER_ENTERED", "data": data}
+
+        resp = (
+            sheets.spreadsheets()
+            .values()
+            .batchUpdate(spreadsheetId=self._spreadsheet_id, body=body)
+            .execute(num_retries=2)
+        )
+        return resp

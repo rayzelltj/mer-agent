@@ -1,258 +1,61 @@
-# QuickBooks Integration - Implementation Summary
+# QuickBooks Online (QBO) Integration - Current Implementation Summary
 
-## ✅ What Has Been Implemented
+This repo integrates with QuickBooks Online for MER review flows (e.g., pulling a Balance Sheet and comparing it to MER entries).
 
-I've set up a complete QuickBooks Online (QBO) OAuth 2.0 integration for your MER review agent. Here's what's been created:
+This document intentionally describes the **current, actual code paths** (and does **not** describe older/placeholder endpoints like `/api/v4/quickbooks/*`).
 
-### 1. Configuration (✅ Completed)
+## What’s Implemented
 
-**File**: `src/backend/common/config/app_config.py`
-- Added QuickBooks configuration settings:
-  - `QB_CLIENT_ID`
-  - `QB_CLIENT_SECRET`
-  - `QB_REDIRECT_URI`
-  - `QB_ENVIRONMENT` (sandbox/production)
-  - `QB_SCOPE`
+### 1) QBO client + report parsing
 
-### 2. Service Layer (✅ Completed)
+- QBO HTTP client and token refresh logic: `src/backend/v4/integrations/qbo_client.py`
+- Report parsing helpers (Balance Sheet, etc.): `src/backend/v4/integrations/qbo_reports.py`
 
-**File**: `src/backend/v4/common/services/quickbooks_service.py`
-- Complete OAuth 2.0 flow implementation
-- Token management (access token, refresh token)
-- Automatic token refresh when expired
-- Chart of Accounts retrieval
-- Company Info retrieval
-- Proper error handling and logging
+The backend MER route uses this client to fetch a Balance Sheet report and then extracts line items for deterministic checks.
 
-**Key Methods**:
-- `get_authorization_url()` - Generate OAuth authorization URL
-- `exchange_code_for_tokens()` - Exchange authorization code for tokens
-- `get_valid_access_token()` - Get valid token (auto-refreshes if expired)
-- `refresh_access_token()` - Manually refresh tokens
-- `get_chart_of_accounts()` - Retrieve all accounts from QBO
-- `get_company_info()` - Retrieve company information (for testing)
+### 2) Local OAuth helper (recommended for dev)
 
-### 3. API Routes (✅ Completed)
+- Local OAuth helper script: `scripts/qbo_auth_local.py`
 
-**File**: `src/backend/v4/api/router.py`
-- Added 4 new endpoints following your existing patterns:
+This script runs a local callback server, completes OAuth in your browser, and writes tokens to a local JSON file (defaults to `.env_qbo_tokens.json`).
 
-1. **GET `/api/v4/quickbooks/authorize`**
-   - Generates OAuth authorization URL
-   - Returns URL for user to visit
+### 3) MER review integration point
 
-2. **GET `/api/v4/quickbooks/callback`**
-   - Handles OAuth callback from QuickBooks
-   - Exchanges code for tokens
-   - Stores tokens (placeholder - needs implementation)
+- Backend MER endpoint: `POST /api/v4/mer/review/balance_sheet` (implementation in `src/backend/v4/api/router.py`)
 
-3. **GET `/api/v4/quickbooks/company-info`**
-   - Retrieves company information
-   - Useful for testing the connection
+That endpoint:
 
-4. **GET `/api/v4/quickbooks/chart-of-accounts`**
-   - Retrieves complete Chart of Accounts
-   - Returns all accounts with balances
-   - Ready for comparison with MER data
+1. Loads the MER rulebook YAML (default points at `data/mer_rulebooks/balance_sheet_review_points.yaml`)
+2. Reads MER entries from Google Sheets
+3. Pulls QBO Balance Sheet via `QBOClient`
+4. Evaluates rules via the MER rule engine
 
-### 4. Dependencies (✅ Completed)
-
-**File**: `src/backend/requirements.txt`
-- Added `intuit-oauth==1.2.6`
-- Added `requests>=2.31.0`
-
-### 5. Documentation (✅ Completed)
-
-**File**: `docs/QuickBooksSetupGuide.md`
-- Complete step-by-step setup guide
-- OAuth flow explanation
-- Testing instructions
-- Troubleshooting guide
-- Security best practices
-- API reference
-
----
-
-## 🚀 Next Steps for You
-
-### Step 1: Install Dependencies
-
-```bash
-cd src/backend
-pip install -r requirements.txt
-```
-
-### Step 2: Configure Environment Variables
-
-**Important**: The `.env` file should be in `src/backend/.env` (backend directory), NOT in the project root.
-
-Create/update `src/backend/.env`:
-
-```bash
-QB_CLIENT_ID=your_client_id_from_intuit
-QB_CLIENT_SECRET=your_client_secret_from_intuit
-QB_REDIRECT_URI=http://localhost:8000/api/v4/quickbooks/callback
-QB_ENVIRONMENT=sandbox
-QB_SCOPE=com.intuit.quickbooks.accounting
-```
-
-### Step 3: Set Up Intuit Developer Account
-
-Follow the detailed guide in `docs/QuickBooksSetupGuide.md`:
-1. Register your app at https://developer.intuit.com/
-2. Get Client ID and Client Secret
-3. Set redirect URI in Intuit Developer Portal
-4. Use sandbox environment for testing
-
-### Step 4: Test the Integration
-
-1. Start your backend:
-   ```bash
-   cd src/backend
-   python app.py
-   ```
-
-2. Test authorization:
-   - Call `GET /api/v4/quickbooks/authorize`
-   - Visit the returned URL
-   - Complete OAuth flow
-
-3. Test Chart of Accounts:
-   - Call `GET /api/v4/quickbooks/chart-of-accounts`
-   - Verify accounts are returned
-
-### Step 5: Implement Token Storage (⚠️ Important)
-
-**Current Status**: Token storage is a placeholder. You MUST implement this for production.
-
-**Options**:
-1. **Database Storage** (Recommended for your setup):
-   - Store tokens in Cosmos DB
-   - Encrypt sensitive data
-   - Update `_save_tokens()` and `_load_tokens()` methods
-
-2. **Azure Key Vault** (Most Secure):
-   - Store tokens in Azure Key Vault
-   - Better for production environments
-
-See `docs/QuickBooksSetupGuide.md` for implementation examples.
-
-### Step 6: Integrate with MER Comparison
-
-Once you can retrieve Chart of Accounts, integrate with your Google Sheets MER data:
-
-```python
-# Pseudo-code example
-async def compare_mer_with_qbo(user_id: str):
-    # Get QBO accounts
-    qbo_service = QuickBooksService(memory_store)
-    qbo_response = await qbo_service.get_chart_of_accounts(user_id)
-    qbo_accounts = qbo_response["QueryResponse"]["Account"]
-    
-    # Get MER accounts from Google Sheets (your existing code)
-    mer_accounts = get_mer_accounts_from_sheets()
-    
-    # Compare and identify discrepancies
-    discrepancies = []
-    for mer_acc in mer_accounts:
-        qbo_acc = find_matching_qbo_account(mer_acc, qbo_accounts)
-        if qbo_acc and abs(mer_acc["balance"] - qbo_acc["CurrentBalance"]) > 0.01:
-            discrepancies.append({
-                "account": mer_acc["name"],
-                "mer_balance": mer_acc["balance"],
-                "qbo_balance": qbo_acc["CurrentBalance"],
-                "difference": mer_acc["balance"] - qbo_acc["CurrentBalance"]
-            })
-    
-    return discrepancies
-```
-
----
-
-## 📋 Important Notes
-
-### ⚠️ Security Considerations
-
-1. **Token Storage**: Currently uses placeholder. Implement secure storage before production.
-2. **Environment Variables**: Never commit `.env` to Git.
-3. **HTTPS**: Use HTTPS in production (never HTTP).
-4. **Token Refresh**: Implemented automatically, but monitor for issues.
-
-### 🔄 OAuth Flow Summary
-
-```
-1. User calls /api/v4/quickbooks/authorize
-   → Returns authorization_url
-
-2. User visits authorization_url
-   → Logs in to QuickBooks
-   → Grants permissions
-
-3. QuickBooks redirects to /api/v4/quickbooks/callback?code=...&realmId=...
-   → Backend exchanges code for tokens
-   → Tokens stored (needs implementation)
-
-4. User calls /api/v4/quickbooks/chart-of-accounts
-   → Backend uses stored tokens
-   → Returns Chart of Accounts
-```
-
-### 🧪 Testing Checklist
-
-- [ ] Install dependencies
-- [ ] Set environment variables
-- [ ] Register app in Intuit Developer Portal
-- [ ] Test authorization endpoint
-- [ ] Complete OAuth flow
-- [ ] Test company-info endpoint
-- [ ] Test chart-of-accounts endpoint
-- [ ] Verify tokens are retrieved correctly
-- [ ] Test token refresh (wait 1 hour or manually trigger)
-- [ ] Implement token storage
-- [ ] Test full flow with token storage
-
----
-
-## 🐛 Known Limitations / TODO
-
-1. **Token Storage**: Placeholder implementation - needs database integration
-2. **Error Recovery**: Basic error handling - may need enhancement for production
-3. **Rate Limiting**: Not implemented - QuickBooks has API rate limits
-4. **Pagination**: Chart of Accounts query uses MAXRESULTS 1000 - may need pagination for large accounts
-5. **State Validation**: OAuth state parameter validation not fully implemented
-
----
-
-## 📚 Files Created/Modified
-
-### Created:
-- `src/backend/v4/common/services/quickbooks_service.py` - Main service class
-- `docs/QuickBooksSetupGuide.md` - Comprehensive setup guide
-- `docs/QuickBooksIntegrationSummary.md` - This file
-
-### Modified:
-- `src/backend/common/config/app_config.py` - Added QBO config
-- `src/backend/v4/api/router.py` - Added 4 QBO endpoints
-- `src/backend/requirements.txt` - Added dependencies
-
----
-
-## 🆘 Need Help?
-
-1. **Check Documentation**: See `docs/QuickBooksSetupGuide.md` for detailed instructions
-2. **Check Logs**: All operations are logged - check console output
-3. **Verify Configuration**: Double-check environment variables match Intuit Developer Portal
-4. **Test Step-by-Step**: Follow the testing checklist above
-
----
-
-## 📖 Additional Resources
-
-- [QuickBooks API Docs](https://developer.intuit.com/app/developer/qbo/docs/develop/authentication-and-authorization/oauth-2.0)
-- [Intuit Developer Portal](https://developer.intuit.com/)
-- [QuickBooks Query Language](https://developer.intuit.com/app/developer/qbo/docs/develop/explore-the-quickbooks-online-api/data-queries)
-
----
-
-**Status**: ✅ Implementation Complete - Ready for Testing
-**Last Updated**: January 2025
+## Environment Variables (QBO)
+
+The code expects `QBO_*` variables. The key ones are:
+
+- `QBO_CLIENT_ID`
+- `QBO_CLIENT_SECRET`
+- `QBO_ENVIRONMENT` (`sandbox` or `production`)
+- `QBO_REDIRECT_URI` (for local dev, typically `http://localhost:8040/qbo/callback`)
+- `QBO_TOKENS_PATH` (optional; defaults to `.env_qbo_tokens.json`)
+
+## How to Run (Dev)
+
+1. Create tokens (one-time per environment/account):
+
+   - Run `python scripts/qbo_auth_local.py`
+   - Complete the browser consent
+   - Confirm `.env_qbo_tokens.json` was created/updated
+
+2. Run MER checks:
+
+   - Run the backend and call `POST /api/v4/mer/review/balance_sheet`, or
+   - Use the MER local runner (`scripts/mer_llm_agent_local.py`) in tool-only mode to exercise the deterministic pipeline.
+
+## Notes / Guardrails
+
+- This repo currently relies on a **local token file** for QBO dev runs; treat it like a secret.
+- If you’re looking for the authoritative setup steps, use `docs/QuickBooksSetupGuide.md` (this file is just a summary).
+
+**Last Updated**: January 2026

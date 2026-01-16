@@ -2,8 +2,8 @@
 Tech Support MCP tools service.
 """
 
-from core.factory import MCPToolBase, Domain
-from utils.formatters import format_success_response, format_error_response
+from ..core.factory import MCPToolBase, Domain
+from ..utils.formatters import format_success_response, format_error_response
 
 
 class TechSupportService(MCPToolBase):

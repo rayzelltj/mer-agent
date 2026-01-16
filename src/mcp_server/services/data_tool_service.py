@@ -1,7 +1,7 @@
 import os
 import logging
 from typing import List
-from core.factory import MCPToolBase, Domain
+from ..core.factory import MCPToolBase, Domain
 
 ALLOWED_FILES = [
     "competitor_Pricing_Analysis.csv",

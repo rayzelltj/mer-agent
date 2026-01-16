@@ -1,5 +1,6 @@
-"""
-Test configuration for agent tests.
+"""Pytest configuration.
+
+Ensures local packages can be imported consistently during test collection.
 """
 
 import sys
@@ -7,9 +8,23 @@ from pathlib import Path
 
 import pytest
 
-# Add the agents path
-agents_path = Path(__file__).parent.parent.parent / "backend" / "v4" / "magentic_agents"
-sys.path.insert(0, str(agents_path))
+
+def _prepend_sys_path(path: Path) -> None:
+    resolved = str(path.resolve())
+    if resolved not in sys.path:
+        sys.path.insert(0, resolved)
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+
+# Allow importing `common`, `v4`, etc. as top-level modules (used throughout backend code).
+_prepend_sys_path(REPO_ROOT / "src" / "backend")
+
+# Allow importing `src.*` package explicitly.
+_prepend_sys_path(REPO_ROOT)
+
+# Back-compat: some tests import agent modules directly.
+_prepend_sys_path(REPO_ROOT / "src" / "backend" / "v4" / "magentic_agents")
 
 @pytest.fixture
 def agent_env_vars():

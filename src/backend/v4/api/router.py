@@ -7,18 +7,18 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
-import v4.models.messages as messages
-from v4.models.messages import WebsocketMessageType
-from auth.auth_utils import get_authenticated_user_details
-from common.database.database_factory import DatabaseFactory
-from common.models.messages_af import (
+from src.backend.v4.models import messages as messages
+from src.backend.v4.models.messages import WebsocketMessageType
+from src.backend.auth.auth_utils import get_authenticated_user_details
+from src.backend.common.database.database_factory import DatabaseFactory
+from src.backend.common.models.messages_af import (
     InputTask,
     Plan,
     PlanStatus,
     TeamSelectionRequest,
 )
-from common.utils.event_utils import track_event_if_configured
-from common.utils.utils_af import (
+from src.backend.common.utils.event_utils import track_event_if_configured
+from src.backend.common.utils.utils_af import (
     find_first_available_team,
     rai_success,
     rai_validate_team_config,
@@ -35,14 +35,14 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from pydantic import BaseModel
-from v4.common.services.plan_service import PlanService
-from v4.common.services.team_service import TeamService
-from v4.config.settings import (
+from src.backend.v4.common.services.plan_service import PlanService
+from src.backend.v4.common.services.team_service import TeamService
+from src.backend.v4.config.settings import (
     connection_config,
     orchestration_config,
     team_config,
 )
-from v4.orchestration.orchestration_manager import OrchestrationManager
+from src.backend.v4.orchestration.orchestration_manager import OrchestrationManager
 
 from src.backend.v4.integrations.google_sheets_reader import (
     GoogleSheetsReader,
@@ -52,9 +52,11 @@ from src.backend.v4.integrations.google_sheets_reader import (
 from src.backend.v4.integrations.qbo_client import QBOClient
 from src.backend.v4.integrations.qbo_reports import (
     extract_balance_sheet_items,
-    extract_aged_detail_items_over_threshold,
-    find_first_amount,
-    extract_report_total_value,
+)
+from src.backend.v4.use_cases.mer_rule_engine import (
+    MERBalanceSheetEvaluationContext,
+    MERBalanceSheetRuleEngine,
+    collect_action_items,
 )
 from src.backend.v4.use_cases.mer_review_checks import (
     check_bank_balance_matches,
@@ -66,21 +68,6 @@ from src.backend.v4.use_cases.mer_review_checks import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-
-def _qbo_report_permission_denied(err: Exception) -> bool:
-    """Detect QBO Reports API permission denial for a report name.
-
-    QBO commonly returns HTTP 400 with ValidationFault code 5020 and element
-    ReportName when the app/user lacks entitlement for a specific report.
-    """
-
-    msg = str(err)
-    return (
-        "Permission Denied" in msg
-        and "ReportName" in msg
-        and "5020" in msg
-    )
 
 app_v4 = APIRouter(
     prefix="/api/v4",
@@ -166,9 +153,10 @@ async def mer_review_balance_sheet(body: MERBalanceSheetReviewRequest):
     zero_amount = ((tolerances.get("zero_balance") or {}).get("amount"))
     zero_tolerance = _decimal_from_rulebook_amount(zero_amount)
 
-    # Amount match tolerance is explicitly marked requires_clarification in the rulebook.
-    # To avoid assumptions, default to exact match (0.00) unless caller overrides the YAML.
-    amount_match_tolerance = Decimal("0.00")
+    amount_match_cfg = (tolerances.get("amount_match") or {})
+    amount_match_default = amount_match_cfg.get("default_amount")
+    # Rulebook default is exact match (0.00) unless overridden.
+    amount_match_tolerance = _decimal_from_rulebook_amount(amount_match_default)
 
     # Fetch MER sheet rows
     reader = GoogleSheetsReader.from_env()
@@ -222,451 +210,20 @@ async def mer_review_balance_sheet(body: MERBalanceSheetReviewRequest):
     )
     qbo_items = extract_balance_sheet_items(report)
 
-    # Run rules (only those with evaluation types we currently implement)
-    results: list[dict] = []
-    implemented_types = {
-        "balance_sheet_line_items_must_be_zero",
-        "mer_line_amount_matches_qbo_line_amount",
-        "mer_bank_balance_matches_qbo_bank_balance",
-        "qbo_report_total_matches_balance_sheet_line",
-        "qbo_aging_items_older_than_threshold_require_explanation",
-    }
-
-    for rule in (rulebook.get("rules") or []):
-        if not isinstance(rule, dict):
-            continue
-        rule_id = rule.get("rule_id")
-        eval_type = ((rule.get("evaluation") or {}).get("type"))
-        if not rule_id or not eval_type:
-            continue
-
-        if eval_type not in implemented_types:
-            results.append(
-                {
-                    "rule_id": rule_id,
-                    "status": "unimplemented",
-                    "evaluation_type": eval_type,
-                }
-            )
-            continue
-
-        if eval_type == "balance_sheet_line_items_must_be_zero":
-            substrings = (
-                ((rule.get("applies_to") or {}).get("qbo_balance_sheet_lines") or {})
-                .get("label_contains_any")
-                or []
-            )
-            if not isinstance(substrings, list) or not substrings:
-                results.append(
-                    {
-                        "rule_id": rule_id,
-                        "status": "skipped",
-                        "reason": "No label_contains_any substrings configured",
-                        "evaluation_type": eval_type,
-                    }
-                )
-                continue
-
-            substring = str(substrings[0])
-            mer_matches = find_values_for_rows_containing(
-                rows=rows,
-                row_substring=substring,
-                col_header=selected_month,
-                header_row_index=header_row_index,
-            )
-
-            check = check_zero_on_both_sides_by_substring(
-                check_id=rule_id,
-                mer_lines=[(m.row_text, m.value) for m in mer_matches],
-                qbo_lines=qbo_items,
-                label_substring=substring,
-                tolerance=zero_tolerance,
-                rule=rule.get("title") or "Balance sheet line items must be zero",
-            )
-            results.append(
-                {
-                    "rule_id": rule_id,
-                    "status": "passed" if check.passed else "failed",
-                    "evaluation_type": eval_type,
-                    "details": check.details,
-                }
-            )
-            continue
-
-        if eval_type == "mer_line_amount_matches_qbo_line_amount":
-            substrings = (
-                ((rule.get("applies_to") or {}).get("qbo_balance_sheet_lines") or {})
-                .get("label_contains_any")
-                or []
-            )
-            if not isinstance(substrings, list) or not substrings:
-                results.append(
-                    {
-                        "rule_id": rule_id,
-                        "status": "skipped",
-                        "reason": "No label_contains_any configured",
-                        "evaluation_type": eval_type,
-                    }
-                )
-                continue
-
-            substring = str(substrings[0])
-            mer_candidates = find_values_for_rows_containing(
-                rows=rows,
-                row_substring=substring,
-                col_header=selected_month,
-                header_row_index=header_row_index,
-            )
-            qbo_raw = find_first_amount(qbo_items, substring)
-            qbo_amount = parse_money(qbo_raw)
-
-            if len(mer_candidates) != 1:
-                results.append(
-                    {
-                        "rule_id": rule_id,
-                        "status": "failed",
-                        "evaluation_type": eval_type,
-                        "details": {
-                            "rule": rule.get("title"),
-                            "reason": "MER match ambiguous or missing (expected exactly one match)",
-                            "mer_matches": [
-                                {
-                                    "a1_cell": m.a1_cell,
-                                    "row_text": m.row_text,
-                                    "value": m.value,
-                                }
-                                for m in mer_candidates
-                            ],
-                            "qbo_first_match_raw": qbo_raw,
-                        },
-                    }
-                )
-                continue
-
-            mer_amount = parse_money(mer_candidates[0].value)
-            check = check_petty_cash_matches(
-                mer_amount=mer_amount,
-                qbo_amount=qbo_amount,
-                tolerance=amount_match_tolerance,
-            )
-            results.append(
-                {
-                    "rule_id": rule_id,
-                    "status": "passed" if check.passed else "failed",
-                    "evaluation_type": eval_type,
-                    "details": {
-                        **check.details,
-                        "mer_a1_cell": mer_candidates[0].a1_cell,
-                        "mer_row_text": mer_candidates[0].row_text,
-                        "qbo_label_substring": substring,
-                        "qbo_first_match_raw": qbo_raw,
-                    },
-                }
-            )
-            continue
-
-        if eval_type == "mer_bank_balance_matches_qbo_bank_balance":
-            if not body.mer_bank_row_key or not body.qbo_bank_label_substring:
-                results.append(
-                    {
-                        "rule_id": rule_id,
-                        "status": "skipped",
-                        "evaluation_type": eval_type,
-                        "reason": "Provide mer_bank_row_key and qbo_bank_label_substring",
-                    }
-                )
-                continue
-
-            mer_lookup = find_value_in_table(
-                rows=rows,
-                row_key=body.mer_bank_row_key,
-                col_header=selected_month,
-                header_row_index=header_row_index,
-            )
-            mer_amount = parse_money(mer_lookup.value)
-            qbo_raw = find_first_amount(qbo_items, body.qbo_bank_label_substring)
-            qbo_amount = parse_money(qbo_raw)
-            check = check_bank_balance_matches(
-                mer_amount=mer_amount,
-                qbo_amount=qbo_amount,
-                tolerance=amount_match_tolerance,
-            )
-            results.append(
-                {
-                    "rule_id": rule_id,
-                    "status": "passed" if check.passed else "failed",
-                    "evaluation_type": eval_type,
-                    "details": {
-                        **check.details,
-                        "mer_row_key": body.mer_bank_row_key,
-                        "mer_a1_cell": mer_lookup.a1_cell,
-                        "qbo_label_substring": body.qbo_bank_label_substring,
-                        "qbo_first_match_raw": qbo_raw,
-                    },
-                }
-            )
-            continue
-
-        if eval_type == "qbo_report_total_matches_balance_sheet_line":
-            qbo_reports_required = (
-                (rule.get("evaluation") or {}).get("qbo_reports_required") or []
-            )
-            if not isinstance(qbo_reports_required, list) or not qbo_reports_required:
-                results.append(
-                    {
-                        "rule_id": rule_id,
-                        "status": "skipped",
-                        "reason": "Missing evaluation.qbo_reports_required",
-                        "evaluation_type": eval_type,
-                    }
-                )
-                continue
-
-            # Determine which aging report to use (AP vs AR)
-            aging_report: dict[str, Any] | None = None
-            bs_label_substring: str | None = None
-            required_tokens: list[str] = []
-
-            if "aged_payables_detail" in qbo_reports_required:
-                try:
-                    # Prefer the canonical report name (works in more tenants).
-                    aging_report = qbo.get_aged_payables_total(end_date=body.end_date)
-                except Exception as e:
-                    if _qbo_report_permission_denied(e):
-                        results.append(
-                            {
-                                "rule_id": rule_id,
-                                "status": "skipped",
-                                "evaluation_type": eval_type,
-                                "details": {
-                                    "rule": rule.get("title"),
-                                    "reason": "blocked_by_qbo_report_permission",
-                                    "report": "AgedPayables*",
-                                    "error": str(e),
-                                },
-                            }
-                        )
-                        continue
-                    raise
-                bs_label_substring = "accounts payable"
-                # In AgedPayables payloads, the row label is often literally "TOTAL".
-                required_tokens = ["total"]
-            elif "aged_receivables_detail" in qbo_reports_required:
-                try:
-                    aging_report = qbo.get_aged_receivables_total(end_date=body.end_date)
-                except Exception as e:
-                    if _qbo_report_permission_denied(e):
-                        results.append(
-                            {
-                                "rule_id": rule_id,
-                                "status": "skipped",
-                                "evaluation_type": eval_type,
-                                "details": {
-                                    "rule": rule.get("title"),
-                                    "reason": "blocked_by_qbo_report_permission",
-                                    "report": "AgedReceivables*",
-                                    "error": str(e),
-                                },
-                            }
-                        )
-                        continue
-                    raise
-                bs_label_substring = "accounts receivable"
-                required_tokens = ["total"]
-            else:
-                results.append(
-                    {
-                        "rule_id": rule_id,
-                        "status": "skipped",
-                        "reason": f"Unsupported qbo_reports_required: {qbo_reports_required}",
-                        "evaluation_type": eval_type,
-                    }
-                )
-                continue
-
-            total_raw, total_evidence = extract_report_total_value(
-                aging_report or {},
-                total_row_must_contain=required_tokens,
-                prefer_column_titles=["Total"],
-            )
-            total_amount = parse_money(total_raw)
-
-            bs_raw = find_first_amount(qbo_items, bs_label_substring or "")
-            bs_amount = parse_money(bs_raw)
-
-            if total_amount is None or bs_amount is None:
-                results.append(
-                    {
-                        "rule_id": rule_id,
-                        "status": "failed",
-                        "evaluation_type": eval_type,
-                        "details": {
-                            "rule": rule.get("title"),
-                            "reason": "Could not parse totals from QBO reports",
-                            "period_end_date": body.end_date,
-                            "balance_sheet_label_substring": bs_label_substring,
-                            "balance_sheet_amount_raw": bs_raw,
-                            "aging_report_total_raw": total_raw,
-                            "aging_report_evidence": total_evidence,
-                        },
-                    }
-                )
-                continue
-
-            delta = total_amount - bs_amount
-            passed = abs(delta) <= amount_match_tolerance
-            results.append(
-                {
-                    "rule_id": rule_id,
-                    "status": "passed" if passed else "failed",
-                    "evaluation_type": eval_type,
-                    "details": {
-                        "rule": rule.get("title"),
-                        "period_end_date": body.end_date,
-                        "balance_sheet_label_substring": bs_label_substring,
-                        "balance_sheet_amount_raw": bs_raw,
-                        "balance_sheet_amount": str(bs_amount),
-                        "aging_report_total_raw": total_raw,
-                        "aging_report_total": str(total_amount),
-                        "tolerance": str(amount_match_tolerance),
-                        "delta": str(delta),
-                        "aging_report_evidence": total_evidence,
-                    },
-                }
-            )
-            continue
-
-        if eval_type == "qbo_aging_items_older_than_threshold_require_explanation":
-            params = rule.get("parameters") or {}
-            max_age_days = params.get("max_age_days")
-            try:
-                max_age_days_int = int(max_age_days)
-            except Exception:
-                results.append(
-                    {
-                        "rule_id": rule_id,
-                        "status": "skipped",
-                        "evaluation_type": eval_type,
-                        "reason": "parameters.max_age_days must be an integer",
-                    }
-                )
-                continue
-
-            limit = max(int(os.environ.get("MER_AGENT_AGING_ITEMS_LIMIT", "100")), 0)
-
-            try:
-                ap_report = qbo.get_aged_payables_detail(end_date=body.end_date)
-                ar_report = qbo.get_aged_receivables_detail(end_date=body.end_date)
-            except Exception as e:
-                if _qbo_report_permission_denied(e):
-                    results.append(
-                        {
-                            "rule_id": rule_id,
-                            "status": "skipped",
-                            "evaluation_type": eval_type,
-                            "details": {
-                                "rule": rule.get("title"),
-                                "reason": "blocked_by_qbo_report_permission",
-                                "reports": ["AgedPayables*", "AgedReceivables*"],
-                                "error": str(e),
-                            },
-                        }
-                    )
-                    continue
-                raise
-
-            ap = extract_aged_detail_items_over_threshold(
-                ap_report or {}, max_age_days=max_age_days_int, limit=limit
-            )
-            ar = extract_aged_detail_items_over_threshold(
-                ar_report or {}, max_age_days=max_age_days_int, limit=limit
-            )
-
-            ap_items = ap.get("items") or []
-            ar_items = ar.get("items") or []
-            has_findings = bool(ap_items) or bool(ar_items)
-
-            results.append(
-                {
-                    "rule_id": rule_id,
-                    "status": "failed" if has_findings else "passed",
-                    "evaluation_type": eval_type,
-                    "details": {
-                        "rule": rule.get("title"),
-                        "period_end_date": body.end_date,
-                        "max_age_days": max_age_days_int,
-                        "requires_explanation": True,
-                        "explanation_mode": "manual",  # Option A
-                        "ap": {
-                            "count": len(ap_items),
-                            "total_over_threshold": ap.get("total_over_threshold"),
-                            "items": ap_items,
-                            "evidence": ap.get("evidence"),
-                        },
-                        "ar": {
-                            "count": len(ar_items),
-                            "total_over_threshold": ar.get("total_over_threshold"),
-                            "items": ar_items,
-                            "evidence": ar.get("evidence"),
-                        },
-                        "action": "Provide an explanation/comment/link for each > threshold open AP/AR item",
-                    },
-                }
-            )
-            continue
-
-    def _collect_action_items(rulebook_doc: dict) -> list[dict]:
-        rules = (rulebook_doc.get("rules") or [])
-        if not isinstance(rules, list):
-            return []
-
-        def _walk_for_actions(obj: Any, out: set[str]) -> None:
-            if isinstance(obj, dict):
-                act = obj.get("action")
-                if isinstance(act, str) and act.strip():
-                    out.add(act.strip())
-                for v in obj.values():
-                    _walk_for_actions(v, out)
-            elif isinstance(obj, list):
-                for v in obj:
-                    _walk_for_actions(v, out)
-
-        items: list[dict] = []
-        limit = max(int(os.environ.get("MER_AGENT_ACTION_ITEMS_LIMIT", "10")), 0)
-
-        for r in rules:
-            if not isinstance(r, dict):
-                continue
-            rid = r.get("rule_id")
-            if not rid:
-                continue
-
-            actions: set[str] = set()
-
-            if bool(r.get("manual_attestation_required")):
-                actions.add("manual_attestation_required")
-
-            sop = r.get("sop_expectation")
-            if isinstance(sop, dict) and bool(sop.get("required_step")):
-                actions.add("required_manual_review_step")
-
-            pa = r.get("process_actions")
-            if pa is not None:
-                _walk_for_actions(pa, actions)
-
-            if actions:
-                items.append(
-                    {
-                        "rule_id": str(rid),
-                        "title": str(r.get("title") or ""),
-                        "actions": sorted(actions),
-                    }
-                )
-
-            if limit and len(items) >= limit:
-                break
-
-        return items
+    engine = MERBalanceSheetRuleEngine()
+    ctx = MERBalanceSheetEvaluationContext(
+        end_date=body.end_date,
+        mer_rows=rows,
+        mer_selected_month_header=selected_month,
+        mer_header_row_index=header_row_index,
+        qbo_balance_sheet_items=qbo_items,
+        qbo_client=qbo,
+        zero_tolerance=zero_tolerance,
+        amount_match_tolerance=amount_match_tolerance,
+        mer_bank_row_key=body.mer_bank_row_key,
+        qbo_bank_label_substring=body.qbo_bank_label_substring,
+    )
+    results = engine.evaluate(rulebook=rulebook, ctx=ctx)
 
     return {
         "rulebook": {
@@ -695,7 +252,7 @@ async def mer_review_balance_sheet(body: MERBalanceSheetReviewRequest):
         "requires_clarification": (rulebook.get("rulebook") or {}).get(
             "requires_clarification", []
         ),
-        "action_items": _collect_action_items(rulebook),
+        "action_items": collect_action_items(rulebook),
         "results": results,
     }
 

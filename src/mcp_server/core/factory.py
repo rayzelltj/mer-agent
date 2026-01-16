@@ -5,7 +5,11 @@ Core MCP server components and factory patterns.
 from abc import ABC, abstractmethod
 from typing import Dict, Optional, Any
 from enum import Enum
-from fastmcp import FastMCP
+
+try:
+    from fastmcp import FastMCP
+except ImportError:  # pragma: no cover
+    FastMCP = None  # type: ignore[assignment]
 
 
 class Domain(Enum):
@@ -54,6 +58,11 @@ class MCPToolFactory:
 
     def create_mcp_server(self, name: str = "MACAE MCP Server", auth=None) -> FastMCP:
         """Create and configure the MCP server with all registered services."""
+        if FastMCP is None:
+            raise ImportError(
+                "fastmcp is not installed. Install the optional MCP dependencies to create a server."
+            )
+
         self._mcp_server = FastMCP(name, auth=auth)
 
         # Register all tools from all services

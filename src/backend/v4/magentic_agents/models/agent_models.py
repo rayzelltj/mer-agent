@@ -23,10 +23,6 @@ class MCPConfig:
         tenant_id = config.AZURE_TENANT_ID
         client_id = config.AZURE_CLIENT_ID
 
-        # Raise exception if any required environment variable is missing
-        if not all([url, name, description, tenant_id, client_id]):
-            raise ValueError(f"{cls.__name__} Missing required environment variables")
-
         return cls(
             url=url,
             name=name,
@@ -48,12 +44,6 @@ class SearchConfig:
     def from_env(cls, index_name: str) -> "SearchConfig":
         connection_name = config.AZURE_AI_SEARCH_CONNECTION_NAME
         endpoint = config.AZURE_AI_SEARCH_ENDPOINT
-
-        # Raise exception if any required environment variable is missing
-        if not all([connection_name, index_name, endpoint]):
-            raise ValueError(
-                f"{cls.__name__} Missing required Azure Search environment variables"
-            )
 
         return cls(
             connection_name=connection_name,

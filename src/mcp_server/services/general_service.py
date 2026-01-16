@@ -2,9 +2,9 @@
 General purpose MCP tools service.
 """
 
-from core.factory import Domain, MCPToolBase
-from utils.date_utils import get_current_timestamp
-from utils.formatters import format_error_response, format_success_response
+from ..core.factory import Domain, MCPToolBase
+from ..utils.date_utils import get_current_timestamp
+from ..utils.formatters import format_error_response, format_success_response
 
 
 class GeneralService(MCPToolBase):

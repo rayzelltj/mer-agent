@@ -7,9 +7,8 @@ import pytest
 backend_path = Path(__file__).parent.parent.parent / "backend"
 sys.path.insert(0, str(backend_path))
 
-from af.models.models import MPlan
-from af.orchestration.human_approval_manager import \
-    HumanApprovalMagenticManager
+from v4.models.models import MPlan
+from v4.orchestration.human_approval_manager import HumanApprovalMagenticManager
 
 #
 # Helper dummies to simulate the minimal shape required by plan_to_obj

@@ -1,10 +1,10 @@
 import os
+import os
+from unittest.mock import MagicMock, patch
+
 from src.backend.common.utils.otlp_tracing import (
     configure_oltp_tracing,
 )  # Import directly since it's in backend
-
-# Add the backend directory to the Python path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
 @patch("src.backend.common.utils.otlp_tracing.TracerProvider")
