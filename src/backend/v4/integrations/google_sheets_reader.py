@@ -213,6 +213,10 @@ def find_value_in_table(
 
 
 class GoogleSheetsReader:
+    # Class-level cache for Google Sheets service instances
+    # Key: (service_account_path, readonly) -> service instance
+    _service_cache: dict[tuple[str, bool], Any] = {}
+
     def __init__(
         self,
         *,
@@ -241,7 +245,34 @@ class GoogleSheetsReader:
             timeout_seconds=timeout_seconds,
         )
 
+    @classmethod
+    def from_env_with_spreadsheet_id(cls, spreadsheet_id: str) -> "GoogleSheetsReader":
+        if not spreadsheet_id or not str(spreadsheet_id).strip():
+            raise ValueError("Missing spreadsheet_id")
+
+        service_account_path = os.environ.get("GOOGLE_SA_FILE") or os.path.expanduser(
+            "~/Desktop/service-account.json"
+        )
+        timeout_seconds = int(os.environ.get("GOOGLE_HTTP_TIMEOUT_SECONDS", "30"))
+
+        return cls(
+            spreadsheet_id=str(spreadsheet_id).strip(),
+            service_account_path=service_account_path,
+            timeout_seconds=timeout_seconds,
+        )
+
     def _build_sheets_service(self, *, readonly: bool = True) -> Any:
+        """Build or retrieve cached Google Sheets service.
+
+        The service instance is cached per (service_account_path, readonly) pair
+        to avoid rebuilding credentials and the API client on every call.
+        """
+        cache_key = (self._service_account_path, readonly)
+
+        # Check cache first
+        if cache_key in GoogleSheetsReader._service_cache:
+            return GoogleSheetsReader._service_cache[cache_key]
+
         # Lazy import so unit tests that only use the deterministic helpers
         # do not require Google client libs.
         from google.oauth2 import service_account
@@ -263,12 +294,22 @@ class GoogleSheetsReader:
             scopes=scopes,
         )
 
-        return build(
+        service = build(
             "sheets",
             "v4",
             credentials=creds,
             cache_discovery=False,
         )
+
+        # Cache the service instance
+        GoogleSheetsReader._service_cache[cache_key] = service
+
+        return service
+
+    @classmethod
+    def clear_service_cache(cls) -> None:
+        """Clear the service cache. Useful for testing or credential rotation."""
+        cls._service_cache.clear()
 
     @property
     def spreadsheet_id(self) -> str:

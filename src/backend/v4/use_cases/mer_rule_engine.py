@@ -71,6 +71,36 @@ def _find_col_index_by_header_contains(
     return None
 
 
+def _resolve_mer_comments_col_index(
+    *, rows: list[list[str]], header_row_index: int | None
+) -> tuple[int | None, str]:
+    """Resolve the MER comments column index.
+
+    Preference order:
+    1) Column F (index 5) if present in the header row (per workflow convention).
+    2) A header-based lookup for a column whose header contains "comments".
+
+    Returns (col_index, resolution_mode).
+    """
+
+    # Convention: MER Balance Sheet comments live in column F.
+    fixed_col_index = 5
+    if header_row_index is not None and 0 <= header_row_index < len(rows):
+        header = rows[header_row_index] or []
+        if len(header) > fixed_col_index:
+            return fixed_col_index, "fixed_column_f"
+
+    by_header = _find_col_index_by_header_contains(
+        rows=rows,
+        header_row_index=header_row_index,
+        header_contains="comments",
+    )
+    if by_header is not None:
+        return by_header, "header_contains_comments"
+
+    return None, "missing"
+
+
 def _looks_like_link(s: str | None) -> bool:
     t = (s or "").strip()
     if not t:
@@ -120,6 +150,8 @@ class MERBalanceSheetEvaluationContext:
     amount_match_tolerance: Decimal
     mer_bank_row_key: str | None = None
     qbo_bank_label_substring: str | None = None
+    client_maintenance_rows: list[list[str]] | None = None
+    kyc_rows: list[list[str]] | None = None
 
 
 EvaluationHandler = Callable[[dict[str, Any], MERBalanceSheetEvaluationContext], dict[str, Any]]
@@ -391,12 +423,10 @@ def _default_registry() -> EvaluationRegistry:
     def _eval_mer_lines_require_link_to_support(
         rule: dict[str, Any], ctx: MERBalanceSheetEvaluationContext
     ) -> dict[str, Any]:
-        # Convention (per your clarification): MER Balance Sheet has a "Comments" column
-        # where each line can include comments and/or links.
-        comments_col = _find_col_index_by_header_contains(
+        # Convention: MER Balance Sheet comments are in column F.
+        comments_col, comments_col_mode = _resolve_mer_comments_col_index(
             rows=ctx.mer_rows,
             header_row_index=ctx.mer_header_row_index,
-            header_contains="comments",
         )
         month_col = _find_col_index_by_header_contains(
             rows=ctx.mer_rows,
@@ -412,11 +442,12 @@ def _default_registry() -> EvaluationRegistry:
                     "reason": "Missing required MER column",
                     "required": {
                         "month_header": ctx.mer_selected_month_header,
-                        "comments_header_contains": "comments",
+                        "comments_column": "F (preferred) or header contains 'comments'",
                     },
                     "found": {
                         "month_col_index": month_col,
                         "comments_col_index": comments_col,
+                        "comments_col_resolution": comments_col_mode,
                         "header_row_index": ctx.mer_header_row_index,
                     },
                 },
@@ -465,7 +496,7 @@ def _default_registry() -> EvaluationRegistry:
                 "period_end_date": ctx.end_date,
                 "selected_month_header": ctx.mer_selected_month_header,
                 "comments_col_index": comments_col,
-                "comments_header": "comments",
+                "comments_col_resolution": comments_col_mode,
                 "applicable_nonzero_lines": applicable_count,
                 "missing_support_count": len(missing),
                 "missing_support": missing[:50],
@@ -498,10 +529,9 @@ def _default_registry() -> EvaluationRegistry:
                 },
             }
 
-        comments_col = _find_col_index_by_header_contains(
+        comments_col, comments_col_mode = _resolve_mer_comments_col_index(
             rows=ctx.mer_rows,
             header_row_index=ctx.mer_header_row_index,
-            header_contains="comments",
         )
         month_col = _find_col_index_by_header_contains(
             rows=ctx.mer_rows,
@@ -516,11 +546,12 @@ def _default_registry() -> EvaluationRegistry:
                     "reason": "Missing required MER column",
                     "required": {
                         "month_header": ctx.mer_selected_month_header,
-                        "comments_header_contains": "comments",
+                        "comments_column": "F (preferred) or header contains 'comments'",
                     },
                     "found": {
                         "month_col_index": month_col,
                         "comments_col_index": comments_col,
+                        "comments_col_resolution": comments_col_mode,
                         "header_row_index": ctx.mer_header_row_index,
                     },
                 },
@@ -595,10 +626,204 @@ def _default_registry() -> EvaluationRegistry:
                 "period_end_date": ctx.end_date,
                 "selected_month_header": ctx.mer_selected_month_header,
                 "comments_col_index": comments_col,
+                "comments_col_resolution": comments_col_mode,
                 "missing_support_count": len(missing),
                 "missing_support": missing[:50],
                 "scoping": "loan_lines_only" if is_loan_rule else "nonzero_lines",
                 "note": "Support is read from the MER Balance Sheet 'Comments' column; any non-empty comment/link counts as supported.",
+            },
+        }
+
+    @reg.register("inventory_accounts_must_exist_in_qbo_and_mer")
+    def _eval_inventory_accounts_must_exist_in_qbo_and_mer(
+        rule: dict[str, Any], ctx: MERBalanceSheetEvaluationContext
+    ) -> dict[str, Any]:
+        # Prefer explicit kyc_rows; fall back to client_maintenance_rows for backwards compat
+        kyc_rows = ctx.kyc_rows or ctx.client_maintenance_rows
+        if not kyc_rows:
+            return {
+                "status": "needs_human_review",
+                "details": {
+                    "rule": rule.get("title"),
+                    "period_end_date": ctx.end_date,
+                    "reason": "missing_client_maintenance_rows",
+                    "required_sources": _extract_rule_required_sources(rule),
+                    "action_items": (
+                        _extract_rule_action_items(rule)
+                        + [
+                            "provide_client_maintenance_spreadsheet_id_and_range",
+                            "confirm_inventory_tab_schema",
+                        ]
+                    ),
+                },
+            }
+
+        def _norm_name(s: str | None) -> str:
+            return "".join(ch.lower() for ch in (s or "") if ch.isalnum())
+
+        header_row_index: int | None = None
+        for i, r in enumerate(kyc_rows[:25]):
+            row_joined = " ".join(str(c or "") for c in (r or []))
+            nr = _norm_name(row_joined)
+            if "account" in nr and ("type" in nr or "credit" in nr or "bank" in nr):
+                header_row_index = i
+                break
+
+        if header_row_index is None:
+            header_row_index = 0
+
+        header = kyc_rows[header_row_index] if header_row_index < len(kyc_rows) else []
+        header_norm = [_norm_name(str(c or "")) for c in (header or [])]
+
+        def _find_col(*needles: str) -> int | None:
+            for idx, hn in enumerate(header_norm):
+                if not hn:
+                    continue
+                if all(_norm_name(n) in hn for n in needles if _norm_name(n)):
+                    return idx
+            return None
+
+        account_col = _find_col("account") or _find_col("name")
+        if account_col is None:
+            # fallback: first non-empty header
+            for j, hn in enumerate(header_norm):
+                if hn:
+                    account_col = j
+                    break
+
+        type_col = _find_col("type") or _find_col("account", "type")
+        # optional column where clients may provide the expected QBO label or mapping
+        qbo_label_col = _find_col("qbo") or _find_col("qbo", "label") or _find_col("expected", "qbo") or _find_col("qbo", "name")
+
+        if account_col is None:
+            return {
+                "status": "failed",
+                "details": {
+                    "rule": rule.get("title"),
+                    "reason": "Could not locate account column in client maintenance sheet",
+                    "header_row_index": header_row_index,
+                    "header": header,
+                },
+            }
+
+        # Extract inventory entries.
+        inventory: list[dict[str, str]] = []
+        for r in kyc_rows[header_row_index + 1 :]:
+            row = r or []
+            acct = str(row[account_col] if account_col < len(row) else "").strip()
+            if not acct:
+                continue
+            acct_type = str(row[type_col] if (type_col is not None and type_col < len(row)) else "").strip()
+            expected_qbo_label = (
+                str(row[qbo_label_col]).strip()
+                if (qbo_label_col is not None and qbo_label_col < len(row))
+                else ""
+            )
+            inventory.append({
+                "account_name": acct,
+                "account_type": acct_type,
+                "expected_qbo_label": expected_qbo_label,
+            })
+
+        if not inventory:
+            return {
+                "status": "skipped",
+                "details": {
+                    "rule": rule.get("title"),
+                    "reason": "No inventory entries found in client maintenance sheet",
+                    "header_row_index": header_row_index,
+                },
+            }
+
+        qbo_accounts = []
+        try:
+            qbo_accounts = ctx.qbo_client.get_accounts(max_results=1000)
+        except Exception:
+            # If QBO access is not available for accounts, fall back to human review.
+            return {
+                "status": "needs_human_review",
+                "details": {
+                    "rule": rule.get("title"),
+                    "period_end_date": ctx.end_date,
+                    "reason": "qbo_accounts_unavailable",
+                    "required_sources": _extract_rule_required_sources(rule),
+                    "action_items": (
+                        _extract_rule_action_items(rule)
+                        + ["ensure_qbo_chart_of_accounts_access"]
+                    ),
+                },
+            }
+
+        qbo_names = [str(a.get("Name") or "") for a in (qbo_accounts or []) if isinstance(a, dict)]
+        qbo_norm = {_norm_name(n): n for n in qbo_names if _norm_name(n)}
+
+        def _qbo_has_account(name: str) -> bool:
+            nn = _norm_name(name)
+            if not nn:
+                return False
+            if nn in qbo_norm:
+                return True
+            # fallback: substring match (client naming differences)
+            return any(nn in qn or qn in nn for qn in qbo_norm.keys())
+
+        def _mer_has_line(name: str) -> bool:
+            needle = (name or "").strip().lower()
+            if not needle:
+                return False
+            start = (ctx.mer_header_row_index or 0) + 1
+            for row in ctx.mer_rows[start:]:
+                label = str((row or [""])[0] or "")
+                if needle in label.lower():
+                    return True
+            return False
+
+        findings: list[dict[str, Any]] = []
+        missing_qbo = 0
+        missing_mer = 0
+
+        for inv in inventory:
+            name = inv.get("account_name") or ""
+            # Prefer explicit expected_qbo_label when provided to find QBO account matches
+            expected = inv.get("expected_qbo_label") or ""
+            in_qbo = False
+            qbo_match_detail = None
+            if expected:
+                in_qbo = _qbo_has_account(expected)
+                qbo_match_detail = "expected_label_matched"
+            else:
+                in_qbo = _qbo_has_account(name)
+                qbo_match_detail = "name_based_match"
+            in_mer = _mer_has_line(name)
+            if not in_qbo:
+                missing_qbo += 1
+            if not in_mer:
+                missing_mer += 1
+            findings.append(
+                {
+                    "inventory_account_name": name,
+                    "inventory_account_type": inv.get("account_type") or "",
+                    "expected_qbo_label": inv.get("expected_qbo_label") or "",
+                    "exists_in_qbo_chart_of_accounts": in_qbo,
+                    "qbo_match_method": qbo_match_detail,
+                    "represented_in_mer": in_mer,
+                }
+            )
+
+        status = "passed" if (missing_qbo == 0 and missing_mer == 0) else "failed"
+
+        return {
+            "status": status,
+            "details": {
+                "rule": rule.get("title"),
+                "period_end_date": ctx.end_date,
+                "inventory_count": len(inventory),
+                "missing_in_qbo_count": missing_qbo,
+                "missing_in_mer_count": missing_mer,
+                "header_row_index": header_row_index,
+                "account_name_col_index": account_col,
+                "account_type_col_index": type_col,
+                "findings": findings[:200],
+                "note": "This is a best-effort inventory coverage check; exact column names and per-client mapping may need tuning.",
             },
         }
 
@@ -1011,29 +1236,80 @@ def _default_registry() -> EvaluationRegistry:
 
         ap_items = ap.get("items") or []
         ar_items = ar.get("items") or []
-        has_findings = bool(ap_items) or bool(ar_items)
+
+        comments_col, comments_col_mode = _resolve_mer_comments_col_index(
+            rows=ctx.mer_rows,
+            header_row_index=ctx.mer_header_row_index,
+        )
+
+        def _mer_explanation_for(substring: str) -> dict[str, Any]:
+            out: dict[str, Any] = {
+                "mer_label_substring": substring,
+                "matched_rows": [],
+                "explanation_present": False,
+            }
+            if comments_col is None:
+                out["reason"] = "missing_comments_column"
+                return out
+
+            start = (ctx.mer_header_row_index or 0) + 1
+            for row_index in range(start, len(ctx.mer_rows)):
+                row = ctx.mer_rows[row_index] or []
+                label = (row[0] if row else "") or ""
+                if substring.lower() not in (label or "").lower():
+                    continue
+                comment_raw = row[comments_col] if comments_col < len(row) else None
+                comment_present = bool((comment_raw or "").strip())
+                out["matched_rows"].append(
+                    {
+                        "mer_row_index": row_index,
+                        "mer_label": label,
+                        "comments_a1_cell": _a1_cell(row_index, comments_col),
+                        "comment_present": comment_present,
+                    }
+                )
+                if comment_present:
+                    out["explanation_present"] = True
+
+            if not out["matched_rows"]:
+                out["reason"] = "no_matching_mer_row"
+            return out
+
+        ap_expl = _mer_explanation_for("accounts payable") if ap_items else None
+        ar_expl = _mer_explanation_for("accounts receivable") if ar_items else None
+
+        # Pass logic:
+        # - If no findings: pass.
+        # - If findings exist: require at least one relevant MER comment/link for that section.
+        ap_ok = (ap_expl is None) or bool(ap_expl.get("explanation_present"))
+        ar_ok = (ar_expl is None) or bool(ar_expl.get("explanation_present"))
+        passed = ap_ok and ar_ok
 
         return {
-            "status": "failed" if has_findings else "passed",
+            "status": "passed" if passed else "failed",
             "details": {
                 "rule": rule.get("title"),
                 "period_end_date": ctx.end_date,
                 "max_age_days": max_age_days_int,
                 "requires_explanation": True,
-                "explanation_mode": "manual",
+                "explanation_mode": "mer_comments_column",
+                "comments_col_index": comments_col,
+                "comments_col_resolution": comments_col_mode,
                 "ap": {
                     "count": len(ap_items),
                     "total_over_threshold": ap.get("total_over_threshold"),
                     "items": ap_items,
                     "evidence": ap.get("evidence"),
+                    "mer_explanation": ap_expl,
                 },
                 "ar": {
                     "count": len(ar_items),
                     "total_over_threshold": ar.get("total_over_threshold"),
                     "items": ar_items,
                     "evidence": ar.get("evidence"),
+                    "mer_explanation": ar_expl,
                 },
-                "action": "Provide an explanation/comment/link for each > threshold open AP/AR item",
+                "action": "If any open items are > threshold, add an explanation/comment/link in MER comments column (F) for AP and/or AR.",
             },
         }
 

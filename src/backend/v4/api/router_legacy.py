@@ -1,0 +1,1672 @@
+import asyncio
+import json
+import logging
+import os
+import uuid
+from datetime import date as _date
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Optional
+
+from src.backend.v4.models import messages as messages
+from src.backend.v4.models.messages import WebsocketMessageType
+from src.backend.auth.auth_utils import get_authenticated_user_details
+from src.backend.common.database.database_factory import DatabaseFactory
+from src.backend.common.models.messages_af import (
+    InputTask,
+    Plan,
+    PlanStatus,
+    TeamSelectionRequest,
+)
+from src.backend.common.utils.event_utils import track_event_if_configured
+from src.backend.common.utils.utils_af import (
+    find_first_available_team,
+    rai_success,
+    rai_validate_team_config,
+)
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from pydantic import BaseModel
+from src.backend.v4.common.services.plan_service import PlanService
+from src.backend.v4.common.services.team_service import TeamService
+from src.backend.v4.config.settings import (
+    connection_config,
+    orchestration_config,
+    team_config,
+)
+from src.backend.v4.orchestration.orchestration_manager import OrchestrationManager
+
+from src.backend.v4.integrations.google_sheets_reader import (
+    GoogleSheetsReader,
+    find_value_in_table,
+    find_values_for_rows_containing,
+)
+from src.backend.v4.integrations.qbo_client import QBOClient
+from src.backend.v4.integrations.qbo_reports import (
+    extract_balance_sheet_items,
+)
+from src.backend.v4.use_cases.mer_rule_engine import (
+    MERBalanceSheetEvaluationContext,
+    MERBalanceSheetRuleEngine,
+    collect_action_items,
+)
+from src.backend.v4.use_cases.mer_review_checks import (
+    check_bank_balance_matches,
+    check_petty_cash_matches,
+    check_zero_on_both_sides_by_substring,
+    parse_money,
+    pick_latest_month_header,
+)
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+app_v4 = APIRouter(
+    prefix="/api/v4",
+    responses={404: {"description": "Not found"}},
+)
+
+
+class MERBalanceSheetReviewRequest(BaseModel):
+    end_date: str
+    mer_sheet: str | None = None
+    mer_range: str | None = None
+    mer_month_header: str | None = None
+    rulebook_path: str | None = None
+    mer_bank_row_key: str | None = None
+    qbo_bank_label_substring: str | None = None
+    client_maintenance_spreadsheet_id: str | None = None
+    client_maintenance_sheet: str | None = None
+    client_maintenance_range: str | None = None
+    kyc_spreadsheet_id: str | None = None
+    kyc_sheet: str | None = None
+    kyc_range: str | None = None
+
+
+def _repo_root_from_this_file() -> Path:
+    # router.py is at: src/backend/v4/api/router.py
+    # parents: api -> v4 -> backend -> src -> repo_root
+    return Path(__file__).resolve().parents[4]
+
+
+def _load_rulebook_yaml(path: Path) -> dict:
+    try:
+        import yaml  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise HTTPException(
+            status_code=500,
+            detail=f"YAML support not installed (missing PyYAML): {e}",
+        )
+
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Rulebook not found: {path}")
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid YAML rulebook: {e}")
+    return data if isinstance(data, dict) else {}
+
+
+def _decimal_from_rulebook_amount(amount_str: str | None) -> Decimal:
+    try:
+        return Decimal(str(amount_str))
+    except Exception:
+        return Decimal("0.00")
+
+
+@app_v4.post("/mer/review/balance_sheet")
+async def mer_review_balance_sheet(body: MERBalanceSheetReviewRequest):
+    """Run MER Balance Sheet review checks driven by the YAML rulebook.
+
+    This endpoint is intentionally deterministic + read-only:
+    - Fetches data from QBO and Google Sheets
+    - Executes implemented checks (currently the MVP checks)
+    - Returns a structured JSON payload (does not edit MER)
+    """
+
+    # Validate end_date format early (YYYY-MM-DD)
+    try:
+        _date.fromisoformat(body.end_date)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="end_date must be an ISO date (YYYY-MM-DD)",
+        )
+
+    repo_root = _repo_root_from_this_file()
+    default_rulebook = (
+        repo_root
+        / "data"
+        / "mer_rulebooks"
+        / "balance_sheet_review_points.yaml"
+    )
+    rulebook_path = Path(body.rulebook_path) if body.rulebook_path else default_rulebook
+    if not rulebook_path.is_absolute():
+        rulebook_path = (repo_root / rulebook_path).resolve()
+
+    rulebook = _load_rulebook_yaml(rulebook_path)
+
+    policies = (rulebook.get("rulebook") or {}).get("policies") or {}
+    tolerances = policies.get("tolerances") or {}
+    zero_amount = ((tolerances.get("zero_balance") or {}).get("amount"))
+    zero_tolerance = _decimal_from_rulebook_amount(zero_amount)
+
+    amount_match_cfg = (tolerances.get("amount_match") or {})
+    amount_match_default = amount_match_cfg.get("default_amount")
+    # Rulebook default is exact match (0.00) unless overridden.
+    amount_match_tolerance = _decimal_from_rulebook_amount(amount_match_default)
+
+    # Fetch MER sheet rows
+    reader = GoogleSheetsReader.from_env()
+    sheet = body.mer_sheet
+    if not sheet:
+        titles = reader.list_sheet_titles()
+        if "Balance Sheet" in titles:
+            sheet = "Balance Sheet"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"mer_sheet is required. Available sheets: {titles}",
+            )
+
+    mer_range = body.mer_range or f"'{sheet}'!A1:Z1000"
+    rows = reader.fetch_rows(a1_range=mer_range)
+    if not rows:
+        raise HTTPException(status_code=400, detail="No rows returned from Google Sheets")
+
+    # Optional: Fetch Client Maintenance / KYC rows (used by inventory-based rules)
+    client_maintenance_rows: list[list[str]] | None = None
+    # Prefer explicit caller value, then environment override, then a provided default
+    cm_spreadsheet_id = (
+        body.client_maintenance_spreadsheet_id
+        or os.environ.get("CLIENT_MAINTENANCE_SPREADSHEET_ID")
+        or "1WdGczVyMQ-ywEJHX_A1OeUzobuqyZV4seeEwlnRYkIQ"
+    )
+    if cm_spreadsheet_id:
+        cm_reader = GoogleSheetsReader.from_env_with_spreadsheet_id(cm_spreadsheet_id)
+        # Default to the client's maintenance tab requested by the user
+        cm_sheet = body.client_maintenance_sheet or "Account reconciliation list"
+        cm_range = body.client_maintenance_range or f"'{cm_sheet}'!A1:Z1000"
+        client_maintenance_rows = cm_reader.fetch_rows(a1_range=cm_range)
+
+    # Optional: Fetch separate KYC rows (often a different spreadsheet than Client Maintenance)
+    kyc_rows: list[list[str]] | None = None
+    if body.kyc_spreadsheet_id:
+        kyc_reader = GoogleSheetsReader.from_env_with_spreadsheet_id(body.kyc_spreadsheet_id)
+        kyc_sheet = body.kyc_sheet
+        kyc_range = body.kyc_range
+        if not kyc_range:
+            if not kyc_sheet:
+                raise HTTPException(
+                    status_code=400,
+                    detail="kyc_range is required when kyc_sheet is not provided",
+                )
+            kyc_range = f"'{kyc_sheet}'!A1:Z2000"
+        kyc_rows = kyc_reader.fetch_rows(a1_range=kyc_range)
+
+    # Identify the month header to use
+    header_row_index: int | None = None
+    selected_month = body.mer_month_header
+    if not selected_month:
+        for i, r in enumerate(rows[:25]):
+            candidate = pick_latest_month_header(r)
+            if candidate:
+                header_row_index = i
+                selected_month = candidate
+                break
+        if selected_month is None or header_row_index is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not find a month header row in the first 25 rows (or parse latest month)",
+            )
+    else:
+        # If caller provides a month header, we still need a header row index.
+        for i, r in enumerate(rows[:25]):
+            if any((c or "").strip() for c in r):
+                header_row_index = i
+                break
+        if header_row_index is None:
+            raise HTTPException(status_code=400, detail="Could not detect header row")
+
+    # Fetch QBO Balance Sheet items
+    qbo = QBOClient.from_env()
+    report = qbo.get_balance_sheet(
+        end_date=body.end_date,
+        start_date=body.end_date,
+        accounting_method=None,
+        date_macro=None,
+    )
+    qbo_items = extract_balance_sheet_items(report)
+
+    engine = MERBalanceSheetRuleEngine()
+    ctx = MERBalanceSheetEvaluationContext(
+        end_date=body.end_date,
+        mer_rows=rows,
+        mer_selected_month_header=selected_month,
+        mer_header_row_index=header_row_index,
+        client_maintenance_rows=client_maintenance_rows,
+        kyc_rows=kyc_rows,
+        qbo_balance_sheet_items=qbo_items,
+        qbo_client=qbo,
+        zero_tolerance=zero_tolerance,
+        amount_match_tolerance=amount_match_tolerance,
+        mer_bank_row_key=body.mer_bank_row_key,
+        qbo_bank_label_substring=body.qbo_bank_label_substring,
+    )
+    results = engine.evaluate(rulebook=rulebook, ctx=ctx)
+
+    return {
+        "rulebook": {
+            "id": ((rulebook.get("rulebook") or {}).get("id")),
+            "version": ((rulebook.get("rulebook") or {}).get("version")),
+            "path": str(rulebook_path),
+        },
+        "period_end_date": body.end_date,
+        "mer": {
+            "spreadsheet_id": reader.spreadsheet_id,
+            "sheet": sheet,
+            "range": mer_range,
+            "selected_month_header": selected_month,
+            "header_row_index": header_row_index,
+        },
+        "qbo": {
+            "balance_sheet_items_extracted": len(qbo_items),
+        },
+        "policies": {
+            "zero_tolerance": str(zero_tolerance),
+            "amount_match_tolerance": str(amount_match_tolerance),
+            "amount_match_requires_clarification": bool(
+                (((tolerances.get("amount_match") or {}).get("requires_clarification")))
+            ),
+        },
+        "requires_clarification": (rulebook.get("rulebook") or {}).get(
+            "requires_clarification", []
+        ),
+        "action_items": collect_action_items(rulebook),
+        "results": results,
+    }
+
+
+@app_v4.websocket("/socket/{process_id}")
+async def start_comms(
+    websocket: WebSocket, process_id: str, user_id: str = Query(None)
+):
+    """Web-Socket endpoint for real-time process status updates."""
+
+    # Always accept the WebSocket connection first
+    await websocket.accept()
+
+    user_id = user_id or "00000000-0000-0000-0000-000000000000"
+
+    # Add to the connection manager for backend updates
+    connection_config.add_connection(
+        process_id=process_id, connection=websocket, user_id=user_id
+    )
+    track_event_if_configured(
+        "WebSocketConnectionAccepted", {"process_id": process_id, "user_id": user_id}
+    )
+
+    # Keep the connection open - FastAPI will close the connection if this returns
+    try:
+        # Keep the connection open - FastAPI will close the connection if this returns
+        while True:
+            # no expectation that we will receive anything from the client but this keeps
+            # the connection open and does not take cpu cycle
+            try:
+                message = await websocket.receive_text()
+                logging.debug(f"Received WebSocket message from {user_id}: {message}")
+            except asyncio.TimeoutError:
+                # Ignore timeouts to keep the WebSocket connection open, but avoid a tight loop.
+                logging.debug(
+                    f"WebSocket receive timeout for user {user_id}, process {process_id}"
+                )
+                await asyncio.sleep(0.1)
+            except WebSocketDisconnect:
+                track_event_if_configured(
+                    "WebSocketDisconnect",
+                    {"process_id": process_id, "user_id": user_id},
+                )
+                logging.info(f"Client disconnected from batch {process_id}")
+                break
+    except Exception as e:
+        # Fixed logging syntax - removed the error= parameter
+        logging.error(f"Error in WebSocket connection: {str(e)}")
+    finally:
+        # Always clean up the connection
+        await connection_config.close_connection(process_id=process_id)
+
+
+@app_v4.get("/init_team")
+async def init_team(
+    request: Request,
+    team_switched: bool = Query(False),
+):  # add team_switched: bool parameter
+    """Initialize the user's current team of agents"""
+
+    # Get first available team from 4 to 1 (RFP -> Retail -> Marketing -> HR)
+    # Falls back to HR if no teams are available.
+    logger.info(f"Init team called, team_switched={team_switched}")
+    try:
+        authenticated_user = get_authenticated_user_details(
+            request_headers=request.headers
+        )
+        user_id = authenticated_user["user_principal_id"]
+        if not user_id:
+            track_event_if_configured(
+                "UserIdNotFound", {"status_code": 400, "detail": "no user"}
+            )
+            raise HTTPException(status_code=400, detail="no user")
+
+        # Initialize memory store and service
+        memory_store = await DatabaseFactory.get_database(user_id=user_id)
+        team_service = TeamService(memory_store)
+
+        init_team_id = await find_first_available_team(team_service, user_id)
+
+        # Get current team if user has one
+        user_current_team = await memory_store.get_current_team(user_id=user_id)
+
+        # If no teams available and no current team, return empty state to allow custom team upload
+        if not init_team_id and not user_current_team:
+            logger.info("No teams found in database. System ready for custom team upload.")
+            return {
+                "status": "No teams configured. Please upload a team configuration to get started.",
+                "team_id": None,
+                "team": None,
+                "requires_team_upload": True,
+            }
+
+        # Use current team if available, otherwise use found team
+        if user_current_team:
+            init_team_id = user_current_team.team_id
+            logger.info(f"Using user's current team: {init_team_id}")
+        elif init_team_id:
+            logger.info(f"Using first available team: {init_team_id}")
+            user_current_team = await team_service.handle_team_selection(
+                user_id=user_id, team_id=init_team_id
+            )
+            if user_current_team:
+                init_team_id = user_current_team.team_id
+
+        # Verify the team exists and user has access to it
+        team_configuration = await team_service.get_team_configuration(
+            init_team_id, user_id
+        )
+        if team_configuration is None:
+            # If team doesn't exist, clear current team and return empty state
+            await memory_store.delete_current_team(user_id)
+            logger.info(f"Team configuration '{init_team_id}' not found. Cleared current team.")
+            return {
+                "status": "Current team configuration not found. Please select or upload a team configuration.",
+                "team_id": None,
+                "team": None,
+                "requires_team_upload": True,
+            }
+
+        # Set as current team in memory
+        team_config.set_current_team(
+            user_id=user_id, team_configuration=team_configuration
+        )
+
+        # Initialize agent team for this user session
+        await OrchestrationManager.get_current_or_new_orchestration(
+            user_id=user_id,
+            team_config=team_configuration,
+            team_switched=team_switched,
+            team_service=team_service,
+        )
+
+        return {
+            "status": "Request started successfully",
+            "team_id": init_team_id,
+            "team": team_configuration,
+        }
+
+    except Exception as e:
+        track_event_if_configured(
+            "InitTeamFailed",
+            {
+                "error": str(e),
+            },
+        )
+        raise HTTPException(
+            status_code=400, detail=f"Error starting request: {e}"
+        ) from e
+
+
+@app_v4.post("/process_request")
+async def process_request(
+    background_tasks: BackgroundTasks, input_task: InputTask, request: Request
+):
+    """
+    Create a new plan without full processing.
+
+    ---
+    tags:
+      - Plans
+    parameters:
+      - name: user_principal_id
+        in: header
+        type: string
+        required: true
+        description: User ID extracted from the authentication header
+      - name: body
+        in: body
+        required: true
+        schema:
+          type: object
+          properties:
+            session_id:
+              type: string
+              description: Session ID for the plan
+            description:
+              type: string
+              description: The task description to validate and create plan for
+    responses:
+      200:
+        description: Plan created successfully
+        schema:
+          type: object
+          properties:
+            plan_id:
+              type: string
+              description: The ID of the newly created plan
+            status:
+              type: string
+              description: Success message
+            session_id:
+              type: string
+              description: Session ID associated with the plan
+      400:
+        description: RAI check failed or invalid input
+        schema:
+          type: object
+          properties:
+            detail:
+              type: string
+              description: Error message
+    """
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        track_event_if_configured(
+            "UserIdNotFound", {"status_code": 400, "detail": "no user"}
+        )
+        raise HTTPException(status_code=400, detail="no user found")
+    try:
+        memory_store = await DatabaseFactory.get_database(user_id=user_id)
+        user_current_team = await memory_store.get_current_team(user_id=user_id)
+        team_id = None
+        if user_current_team:
+            team_id = user_current_team.team_id
+        team = await memory_store.get_team_by_id(team_id=team_id)
+        if not team:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Team configuration '{team_id}' not found or access denied",
+            )
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Error retrieving team configuration: {e}",
+        ) from e
+
+    if not await rai_success(input_task.description, team, memory_store):
+        track_event_if_configured(
+            "RAI failed",
+            {
+                "status": "Plan not created - RAI check failed",
+                "description": input_task.description,
+                "session_id": input_task.session_id,
+            },
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Request contains content that doesn't meet our safety guidelines, try again.",
+        )
+
+    if not input_task.session_id:
+        input_task.session_id = str(uuid.uuid4())
+    try:
+        plan_id = str(uuid.uuid4())
+        # Initialize memory store and service
+        plan = Plan(
+            id=plan_id,
+            plan_id=plan_id,
+            user_id=user_id,
+            session_id=input_task.session_id,
+            team_id=team_id,
+            initial_goal=input_task.description,
+            overall_status=PlanStatus.in_progress,
+        )
+        await memory_store.add_plan(plan)
+
+        track_event_if_configured(
+            "PlanCreated",
+            {
+                "status": "success",
+                "plan_id": plan.plan_id,
+                "session_id": input_task.session_id,
+                "user_id": user_id,
+                "team_id": team_id,
+                "description": input_task.description,
+            },
+        )
+    except Exception as e:
+        logger.error(f"Error creating plan: {e}")
+        track_event_if_configured(
+            "PlanCreationFailed",
+            {
+                "status": "error",
+                "description": input_task.description,
+                "session_id": input_task.session_id,
+                "user_id": user_id,
+                "error": str(e),
+            },
+        )
+        raise HTTPException(status_code=500, detail="Failed to create plan") from e
+
+    try:
+
+        async def run_orchestration_task():
+            await OrchestrationManager().run_orchestration(user_id, input_task)
+
+        background_tasks.add_task(run_orchestration_task)
+
+        return {
+            "status": "Request started successfully",
+            "session_id": input_task.session_id,
+            "plan_id": plan_id,
+        }
+
+    except Exception as e:
+        track_event_if_configured(
+            "RequestStartFailed",
+            {
+                "session_id": input_task.session_id,
+                "description": input_task.description,
+                "error": str(e),
+            },
+        )
+        raise HTTPException(
+            status_code=400, detail=f"Error starting request: {e}"
+        ) from e
+
+
+@app_v4.post("/plan_approval")
+async def plan_approval(
+    human_feedback: messages.PlanApprovalResponse, request: Request
+):
+    """
+    Endpoint to receive plan approval or rejection from the user.
+    ---
+    tags:
+      - Plans
+    parameters:
+      - name: user_principal_id
+        in: header
+        type: string
+        required: true
+        description: User ID extracted from the authentication header
+    requestBody:
+      description: Plan approval payload
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              m_plan_id:
+                type: string
+                description: The internal m_plan id for the plan (required)
+              approved:
+                type: boolean
+                description: Whether the plan is approved (true) or rejected (false)
+              feedback:
+                type: string
+                description: Optional feedback or comment from the user
+              plan_id:
+                type: string
+                description: Optional user-facing plan_id
+    responses:
+      200:
+        description: Approval recorded successfully
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+      401:
+        description: Missing or invalid user information
+      404:
+        description: No active plan found for approval
+      500:
+        description: Internal server error
+    """
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid user information"
+        )
+    # Set the approval in the orchestration config
+    try:
+        if user_id and human_feedback.m_plan_id:
+            if (
+                orchestration_config
+                and human_feedback.m_plan_id in orchestration_config.approvals
+            ):
+                orchestration_config.set_approval_result(
+                    human_feedback.m_plan_id, human_feedback.approved
+                )
+                logger.info(f"Plan approval received: {human_feedback}")
+
+                try:
+                    result = await PlanService.handle_plan_approval(
+                        human_feedback, user_id
+                    )
+                    logger.info(f"Plan approval processed: {result}")
+
+                except ValueError as ve:
+                    logger.error(f"ValueError processing plan approval: {ve}")
+                    await connection_config.send_status_update_async(
+                        {
+                            "type": WebsocketMessageType.ERROR_MESSAGE,
+                            "data": {
+                                "content": "Approval failed due to invalid input.",
+                                "status": "error",
+                                "timestamp": asyncio.get_event_loop().time(),
+                            },
+                        },
+                        user_id,
+                        message_type=WebsocketMessageType.ERROR_MESSAGE,
+                    )
+
+                except Exception:
+                    logger.error("Error processing plan approval", exc_info=True)
+                    await connection_config.send_status_update_async(
+                        {
+                            "type": WebsocketMessageType.ERROR_MESSAGE,
+                            "data": {
+                                "content": "An unexpected error occurred while processing the approval.",
+                                "status": "error",
+                                "timestamp": asyncio.get_event_loop().time(),
+                            },
+                        },
+                        user_id,
+                        message_type=WebsocketMessageType.ERROR_MESSAGE,
+                    )
+
+                track_event_if_configured(
+                    "PlanApprovalReceived",
+                    {
+                        "plan_id": human_feedback.plan_id,
+                        "m_plan_id": human_feedback.m_plan_id,
+                        "approved": human_feedback.approved,
+                        "user_id": user_id,
+                        "feedback": human_feedback.feedback,
+                    },
+                )
+
+                return {"status": "approval recorded"}
+            else:
+                logging.warning(
+                    "No orchestration or plan found for plan_id: %s",
+                    human_feedback.m_plan_id
+                )
+                raise HTTPException(
+                    status_code=404, detail="No active plan found for approval"
+                )
+    except Exception as e:
+        logging.error(f"Error processing plan approval: {e}")
+        try:
+            await connection_config.send_status_update_async(
+                {
+                    "type": WebsocketMessageType.ERROR_MESSAGE,
+                    "data": {
+                        "content": "An error occurred while processing your approval request.",
+                        "status": "error",
+                        "timestamp": asyncio.get_event_loop().time(),
+                    },
+                },
+                user_id,
+                message_type=WebsocketMessageType.ERROR_MESSAGE,
+            )
+        except Exception as ws_error:
+            # Don't let WebSocket send failure break the HTTP response
+            logging.warning(f"Failed to send WebSocket error: {ws_error}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app_v4.post("/user_clarification")
+async def user_clarification(
+    human_feedback: messages.UserClarificationResponse, request: Request
+):
+    """
+    Endpoint to receive user clarification responses for clarification requests sent by the system.
+
+    ---
+    tags:
+      - Plans
+    parameters:
+      - name: user_principal_id
+        in: header
+        type: string
+        required: true
+        description: User ID extracted from the authentication header
+    requestBody:
+      description: User clarification payload
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              request_id:
+                type: string
+                description: The clarification request id sent by the system (required)
+              answer:
+                type: string
+                description: The user's answer or clarification text
+              plan_id:
+                type: string
+                description: (Optional) Associated plan_id
+              m_plan_id:
+                type: string
+                description: (Optional) Internal m_plan id
+    responses:
+      200:
+        description: Clarification recorded successfully
+      400:
+        description: RAI check failed or invalid input
+      401:
+        description: Missing or invalid user information
+      404:
+        description: No active plan found for clarification
+      500:
+        description: Internal server error
+    """
+
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid user information"
+        )
+    try:
+        memory_store = await DatabaseFactory.get_database(user_id=user_id)
+        user_current_team = await memory_store.get_current_team(user_id=user_id)
+        team_id = None
+        if user_current_team:
+            team_id = user_current_team.team_id
+        team = await memory_store.get_team_by_id(team_id=team_id)
+        if not team:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Team configuration '{team_id}' not found or access denied",
+            )
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Error retrieving team configuration: {e}",
+        ) from e
+    # Set the approval in the orchestration config
+    if user_id and human_feedback.request_id:
+        # validate rai
+        if human_feedback.answer is not None or human_feedback.answer != "":
+            if not await rai_success(human_feedback.answer, team, memory_store):
+                track_event_if_configured(
+                    "RAI failed",
+                    {
+                        "status": "Plan Clarification ",
+                        "description": human_feedback.answer,
+                        "request_id": human_feedback.request_id,
+                    },
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error_type": "RAI_VALIDATION_FAILED",
+                        "message": "Content Safety Check Failed",
+                        "description": "Your request contains content that doesn't meet our safety guidelines. Please modify your request to ensure it's appropriate and try again.",
+                        "suggestions": [
+                            "Remove any potentially harmful, inappropriate, or unsafe content",
+                            "Use more professional and constructive language",
+                            "Focus on legitimate business or educational objectives",
+                            "Ensure your request complies with content policies",
+                        ],
+                        "user_action": "Please revise your request and try again",
+                    },
+                )
+
+        if (
+            orchestration_config
+            and human_feedback.request_id in orchestration_config.clarifications
+        ):
+            # Use the new event-driven method to set clarification result
+            orchestration_config.set_clarification_result(
+                human_feedback.request_id, human_feedback.answer
+            )
+            try:
+                result = await PlanService.handle_human_clarification(
+                    human_feedback, user_id
+                )
+                logger.info(f"Human clarification processed: {result}")
+            except ValueError as ve:
+                logger.error(f"ValueError processing human clarification: {ve}")
+            except Exception as e:
+                logger.error(f"Error processing human clarification: {e}")
+            track_event_if_configured(
+                "HumanClarificationReceived",
+                {
+                    "request_id": human_feedback.request_id,
+                    "answer": human_feedback.answer,
+                    "user_id": user_id,
+                },
+            )
+            return {
+                "status": "clarification recorded",
+            }
+        else:
+            logging.warning(
+                f"No orchestration or plan found for request_id: {human_feedback.request_id}"
+            )
+            raise HTTPException(
+                status_code=404, detail="No active plan found for clarification"
+            )
+
+
+@app_v4.post("/agent_message")
+async def agent_message_user(
+    agent_message: messages.AgentMessageResponse, request: Request
+):
+    """
+    Endpoint to receive messages from agents (agent -> user communication).
+
+    ---
+    tags:
+      - Agents
+    parameters:
+      - name: user_principal_id
+        in: header
+        type: string
+        required: true
+        description: User ID extracted from the authentication header
+    requestBody:
+      description: Agent message payload
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              plan_id:
+                type: string
+                description: ID of the plan this message relates to
+              agent:
+                type: string
+                description: Name or identifier of the agent sending the message
+              content:
+                type: string
+                description: The message content
+              agent_type:
+                type: string
+                description: Type of agent (AI/Human)
+              m_plan_id:
+                type: string
+                description: Optional internal m_plan id
+    responses:
+      200:
+        description: Message recorded successfully
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+      401:
+        description: Missing or invalid user information
+    """
+
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid user information"
+        )
+    # Set the approval in the orchestration config
+
+    try:
+        result = await PlanService.handle_agent_messages(agent_message, user_id)
+        logger.info(f"Agent message processed: {result}")
+    except ValueError as ve:
+        logger.error(f"ValueError processing agent message: {ve}")
+    except Exception as e:
+        logger.error(f"Error processing agent message: {e}")
+
+    track_event_if_configured(
+        "AgentMessageReceived",
+        {
+            "agent": agent_message.agent,
+            "content": agent_message.content,
+            "user_id": user_id,
+        },
+    )
+    return {
+        "status": "message recorded",
+    }
+
+
+@app_v4.post("/upload_team_config")
+async def upload_team_config(
+    request: Request,
+    file: UploadFile = File(...),
+    team_id: Optional[str] = Query(None),
+):
+    """
+    Upload and save a team configuration JSON file.
+
+    ---
+    tags:
+      - Team Configuration
+    parameters:
+      - name: user_principal_id
+        in: header
+        type: string
+        required: true
+        description: User ID extracted from the authentication header
+      - name: file
+        in: formData
+        type: file
+        required: true
+        description: JSON file containing team configuration
+    responses:
+      200:
+        description: Team configuration uploaded successfully
+      400:
+        description: Invalid request or file format
+      401:
+        description: Missing or invalid user information
+      500:
+        description: Internal server error
+    """
+    # Validate user authentication
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        track_event_if_configured(
+            "UserIdNotFound", {"status_code": 400, "detail": "no user"}
+        )
+        raise HTTPException(status_code=400, detail="no user found")
+    try:
+        memory_store = await DatabaseFactory.get_database(user_id=user_id)
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Error retrieving team configuration: {e}",
+        ) from e
+    # Validate file is provided and is JSON
+    if not file:
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    if not file.filename.endswith(".json"):
+        raise HTTPException(status_code=400, detail="File must be a JSON file")
+
+    try:
+        # Read and parse JSON content
+        content = await file.read()
+        try:
+            json_data = json.loads(content.decode("utf-8"))
+        except json.JSONDecodeError as e:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid JSON format: {str(e)}"
+            ) from e
+
+        # Validate content with RAI before processing
+        if not team_id:
+            rai_valid, rai_error = await rai_validate_team_config(json_data, memory_store)
+            if not rai_valid:
+                track_event_if_configured(
+                    "Team configuration RAI validation failed",
+                    {
+                        "status": "failed",
+                        "user_id": user_id,
+                        "filename": file.filename,
+                        "reason": rai_error,
+                    },
+                )
+                raise HTTPException(status_code=400, detail=rai_error)
+
+        track_event_if_configured(
+            "Team configuration RAI validation passed",
+            {"status": "passed", "user_id": user_id, "filename": file.filename},
+        )
+        team_service = TeamService(memory_store)
+
+        # Validate model deployments
+        models_valid, missing_models = await team_service.validate_team_models(
+            json_data
+        )
+        if not models_valid:
+            error_message = (
+                f"The following required models are not deployed in your Azure AI project: {', '.join(missing_models)}. "
+                f"Please deploy these models in Azure AI Foundry before uploading this team configuration."
+            )
+            track_event_if_configured(
+                "Team configuration model validation failed",
+                {
+                    "status": "failed",
+                    "user_id": user_id,
+                    "filename": file.filename,
+                    "missing_models": missing_models,
+                },
+            )
+            raise HTTPException(status_code=400, detail=error_message)
+
+        track_event_if_configured(
+            "Team configuration model validation passed",
+            {"status": "passed", "user_id": user_id, "filename": file.filename},
+        )
+
+        # Validate search indexes
+        logger.info(f"🔍 Validating search indexes for user: {user_id}")
+        search_valid, search_errors = await team_service.validate_team_search_indexes(
+            json_data
+        )
+        if not search_valid:
+            logger.warning(f"❌ Search validation failed for user {user_id}: {search_errors}")
+            error_message = (
+                f"Search index validation failed:\n\n{chr(10).join([f'• {error}' for error in search_errors])}\n\n"
+                f"Please ensure all referenced search indexes exist in your Azure AI Search service."
+            )
+            track_event_if_configured(
+                "Team configuration search validation failed",
+                {
+                    "status": "failed",
+                    "user_id": user_id,
+                    "filename": file.filename,
+                    "search_errors": search_errors,
+                },
+            )
+            raise HTTPException(status_code=400, detail=error_message)
+
+        logger.info(f"✅ Search validation passed for user: {user_id}")
+        track_event_if_configured(
+            "Team configuration search validation passed",
+            {"status": "passed", "user_id": user_id, "filename": file.filename},
+        )
+
+        # Validate and parse the team configuration
+        try:
+            team_config = await team_service.validate_and_parse_team_config(
+                json_data, user_id
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        # Save the configuration
+        try:
+            logger.info(f"Saving team configuration... team_id={team_id}")
+            if team_id:
+                team_config.team_id = team_id
+                team_config.id = team_id  # Ensure id is also set for updates
+            team_id = await team_service.save_team_configuration(team_config)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to save configuration: {str(e)}"
+            ) from e
+
+        track_event_if_configured(
+            "Team configuration uploaded",
+            {
+                "status": "success",
+                "team_id": team_id,
+                "user_id": user_id,
+                "agents_count": len(team_config.agents),
+                "tasks_count": len(team_config.starting_tasks),
+            },
+        )
+
+        return {
+            "status": "success",
+            "team_id": team_id,
+            "name": team_config.name,
+            "message": "Team configuration uploaded and saved successfully",
+            "team": team_config.model_dump(),  # Return the full team configuration
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error("Unexpected error uploading team configuration: %s", str(e))
+        raise HTTPException(status_code=500, detail="Internal server error occurred")
+
+
+@app_v4.get("/team_configs")
+async def get_team_configs(request: Request):
+    """
+    Retrieve all team configurations for the current user.
+
+    ---
+    tags:
+      - Team Configuration
+    parameters:
+      - name: user_principal_id
+        in: header
+        type: string
+        required: true
+        description: User ID extracted from the authentication header
+    responses:
+      200:
+        description: List of team configurations for the user
+        schema:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              team_id:
+                type: string
+              name:
+                type: string
+              status:
+                type: string
+              created:
+                type: string
+              created_by:
+                type: string
+              description:
+                type: string
+              logo:
+                type: string
+              plan:
+                type: string
+              agents:
+                type: array
+              starting_tasks:
+                type: array
+      401:
+        description: Missing or invalid user information
+    """
+    # Validate user authentication
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid user information"
+        )
+
+    try:
+        # Initialize memory store and service
+        memory_store = await DatabaseFactory.get_database(user_id=user_id)
+        team_service = TeamService(memory_store)
+
+        # Retrieve all team configurations
+        team_configs = await team_service.get_all_team_configurations()
+
+        # Convert to dictionaries for response
+        configs_dict = [config.model_dump() for config in team_configs]
+
+        return configs_dict
+
+    except Exception as e:
+        logging.error(f"Error retrieving team configurations: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error occurred")
+
+
+@app_v4.get("/team_configs/{team_id}")
+async def get_team_config_by_id(team_id: str, request: Request):
+    """
+    Retrieve a specific team configuration by ID.
+
+    ---
+    tags:
+      - Team Configuration
+    parameters:
+      - name: team_id
+        in: path
+        type: string
+        required: true
+        description: The ID of the team configuration to retrieve
+      - name: user_principal_id
+        in: header
+        type: string
+        required: true
+        description: User ID extracted from the authentication header
+    responses:
+      200:
+        description: Team configuration details
+        schema:
+          type: object
+          properties:
+            id:
+              type: string
+            team_id:
+              type: string
+            name:
+              type: string
+            status:
+              type: string
+            created:
+              type: string
+            created_by:
+              type: string
+            description:
+              type: string
+            logo:
+              type: string
+            plan:
+              type: string
+            agents:
+              type: array
+            starting_tasks:
+              type: array
+      401:
+        description: Missing or invalid user information
+      404:
+        description: Team configuration not found
+    """
+    # Validate user authentication
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid user information"
+        )
+
+    try:
+        # Initialize memory store and service
+        memory_store = await DatabaseFactory.get_database(user_id=user_id)
+        team_service = TeamService(memory_store)
+
+        # Retrieve the specific team configuration
+        team_config = await team_service.get_team_configuration(team_id, user_id)
+
+        if team_config is None:
+            raise HTTPException(status_code=404, detail="Team configuration not found")
+
+        # Convert to dictionary for response
+        return team_config.model_dump()
+
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logging.error(f"Error retrieving team configuration: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error occurred")
+
+
+@app_v4.delete("/team_configs/{team_id}")
+async def delete_team_config(team_id: str, request: Request):
+    """
+    Delete a team configuration by ID.
+
+    ---
+    tags:
+      - Team Configuration
+    parameters:
+      - name: team_id
+        in: path
+        type: string
+        required: true
+        description: The ID of the team configuration to delete
+      - name: user_principal_id
+        in: header
+        type: string
+        required: true
+        description: User ID extracted from the authentication header
+    responses:
+      200:
+        description: Team configuration deleted successfully
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+            message:
+              type: string
+            team_id:
+              type: string
+      401:
+        description: Missing or invalid user information
+      404:
+        description: Team configuration not found
+    """
+    # Validate user authentication
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid user information"
+        )
+
+    try:
+        # To do: Check if the team is the users current team, or if it is
+        # used in any active sessions/plans.  Refuse request if so.
+
+        # Initialize memory store and service
+        memory_store = await DatabaseFactory.get_database(user_id=user_id)
+        team_service = TeamService(memory_store)
+
+        # Delete the team configuration
+        deleted = await team_service.delete_team_configuration(team_id, user_id)
+
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Team configuration not found")
+
+        # Track the event
+        track_event_if_configured(
+            "Team configuration deleted",
+            {"status": "success", "team_id": team_id, "user_id": user_id},
+        )
+
+        return {
+            "status": "success",
+            "message": "Team configuration deleted successfully",
+            "team_id": team_id,
+        }
+
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logging.error(f"Error deleting team configuration: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error occurred")
+
+
+@app_v4.post("/select_team")
+async def select_team(selection: TeamSelectionRequest, request: Request):
+    """
+    Select the current team for the user session.
+    """
+    # Validate user authentication
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        raise HTTPException(
+            status_code=401, detail="Missing or invalid user information"
+        )
+
+    if not selection.team_id:
+        raise HTTPException(status_code=400, detail="Team ID is required")
+
+    try:
+        # Initialize memory store and service
+        memory_store = await DatabaseFactory.get_database(user_id=user_id)
+        team_service = TeamService(memory_store)
+
+        # Verify the team exists and user has access to it
+        team_configuration = await team_service.get_team_configuration(
+            selection.team_id, user_id
+        )
+        if team_configuration is None:  # ensure that id is valid
+            raise HTTPException(
+                status_code=404,
+                detail=f"Team configuration '{selection.team_id}' not found or access denied",
+            )
+        set_team = await team_service.handle_team_selection(
+            user_id=user_id, team_id=selection.team_id
+        )
+        if not set_team:
+            track_event_if_configured(
+                "Team selected",
+                {
+                    "status": "failed",
+                    "team_id": selection.team_id,
+                    "team_name": team_configuration.name,
+                    "user_id": user_id,
+                },
+            )
+            raise HTTPException(
+                status_code=404,
+                detail=f"Team configuration '{selection.team_id}' failed to set",
+            )
+
+        # save to in-memory config for current user
+        team_config.set_current_team(
+            user_id=user_id, team_configuration=team_configuration
+        )
+
+        # Track the team selection event
+        track_event_if_configured(
+            "Team selected",
+            {
+                "status": "success",
+                "team_id": selection.team_id,
+                "team_name": team_configuration.name,
+                "user_id": user_id,
+            },
+        )
+
+        return {
+            "status": "success",
+            "message": f"Team '{team_configuration.name}' selected successfully",
+            "team_id": selection.team_id,
+            "team_name": team_configuration.name,
+            "agents_count": len(team_configuration.agents),
+            "team_description": team_configuration.description,
+        }
+
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logging.error(f"Error selecting team: {str(e)}")
+        track_event_if_configured(
+            "Team selection error",
+            {
+                "status": "error",
+                "team_id": selection.team_id,
+                "user_id": user_id,
+                "error": str(e),
+            },
+        )
+        raise HTTPException(status_code=500, detail="Internal server error occurred")
+
+
+# Get plans is called in the initial side rendering of the frontend
+@app_v4.get("/plans")
+async def get_plans(request: Request):
+    """
+    Retrieve plans for the current user.
+
+    ---
+    tags:
+      - Plans
+    parameters:
+      - name: session_id
+        in: query
+        type: string
+        required: false
+        description: Optional session ID to retrieve plans for a specific session
+    responses:
+      200:
+        description: List of plans with steps for the user
+        schema:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                description: Unique ID of the plan
+              session_id:
+                type: string
+                description: Session ID associated with the plan
+              initial_goal:
+                type: string
+                description: The initial goal derived from the user's input
+              overall_status:
+                type: string
+                description: Status of the plan (e.g., in_progress, completed)
+              steps:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                      description: Unique ID of the step
+                    plan_id:
+                      type: string
+                      description: ID of the plan the step belongs to
+                    action:
+                      type: string
+                      description: The action to be performed
+                    agent:
+                      type: string
+                      description: The agent responsible for the step
+                    status:
+                      type: string
+                      description: Status of the step (e.g., planned, approved, completed)
+      400:
+        description: Missing or invalid user information
+      404:
+        description: Plan not found
+    """
+
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        track_event_if_configured(
+            "UserIdNotFound", {"status_code": 400, "detail": "no user"}
+        )
+        raise HTTPException(status_code=400, detail="no user")
+
+    # <To do: Francia> Replace the following with code to get plan run history from the database
+
+    # Initialize memory context
+    memory_store = await DatabaseFactory.get_database(user_id=user_id)
+
+    current_team = await memory_store.get_current_team(user_id=user_id)
+    if not current_team:
+        return []
+
+    all_plans = await memory_store.get_all_plans_by_team_id_status(
+        user_id=user_id, team_id=current_team.team_id, status=PlanStatus.completed
+    )
+
+    return all_plans
+
+
+# Get plans is called in the initial side rendering of the frontend
+@app_v4.get("/plan")
+async def get_plan_by_id(
+    request: Request,
+    plan_id: Optional[str] = Query(None),
+):
+    """
+    Retrieve plans for the current user.
+
+    ---
+    tags:
+      - Plans
+    parameters:
+      - name: session_id
+        in: query
+        type: string
+        required: false
+        description: Optional session ID to retrieve plans for a specific session
+    responses:
+      200:
+        description: List of plans with steps for the user
+        schema:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                description: Unique ID of the plan
+              session_id:
+                type: string
+                description: Session ID associated with the plan
+              initial_goal:
+                type: string
+                description: The initial goal derived from the user's input
+              overall_status:
+                type: string
+                description: Status of the plan (e.g., in_progress, completed)
+              steps:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                      description: Unique ID of the step
+                    plan_id:
+                      type: string
+                      description: ID of the plan the step belongs to
+                    action:
+                      type: string
+                      description: The action to be performed
+                    agent:
+                      type: string
+                      description: The agent responsible for the step
+                    status:
+                      type: string
+                      description: Status of the step (e.g., planned, approved, completed)
+      400:
+        description: Missing or invalid user information
+      404:
+        description: Plan not found
+    """
+
+    authenticated_user = get_authenticated_user_details(request_headers=request.headers)
+    user_id = authenticated_user["user_principal_id"]
+    if not user_id:
+        track_event_if_configured(
+            "UserIdNotFound", {"status_code": 400, "detail": "no user"}
+        )
+        raise HTTPException(status_code=400, detail="no user")
+
+    # <To do: Francia> Replace the following with code to get plan run history from the database
+
+    # Initialize memory context
+    memory_store = await DatabaseFactory.get_database(user_id=user_id)
+    try:
+        if plan_id:
+            plan = await memory_store.get_plan_by_plan_id(plan_id=plan_id)
+            if not plan:
+                track_event_if_configured(
+                    "GetPlanBySessionNotFound",
+                    {"status_code": 400, "detail": "Plan not found"},
+                )
+                raise HTTPException(status_code=404, detail="Plan not found")
+
+            # Use get_steps_by_plan to match the original implementation
+
+            team = await memory_store.get_team_by_id(team_id=plan.team_id)
+            agent_messages = await memory_store.get_agent_messages(plan_id=plan.plan_id)
+            mplan = plan.m_plan if plan.m_plan else None
+            streaming_message = plan.streaming_message if plan.streaming_message else ""
+            plan.streaming_message = ""  # clear streaming message after retrieval
+            plan.m_plan = None  # remove m_plan from plan object for response
+            return {
+                "plan": plan,
+                "team": team if team else None,
+                "messages": agent_messages,
+                "m_plan": mplan,
+                "streaming_message": streaming_message,
+            }
+        else:
+            track_event_if_configured(
+                "GetPlanId", {"status_code": 400, "detail": "no plan id"}
+            )
+            raise HTTPException(status_code=400, detail="no plan id")
+    except Exception as e:
+        logging.error(f"Error retrieving plan: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error occurred")

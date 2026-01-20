@@ -11,11 +11,242 @@ from src.backend.v4.use_cases.mer_rule_engine import (
 
 
 class _StubQBO:
-    def __init__(self, *, aged_payables_total: dict | None = None):
+    def __init__(
+        self,
+        *,
+        aged_payables_total: dict | None = None,
+        aged_payables_detail: dict | None = None,
+        aged_receivables_detail: dict | None = None,
+        accounts: list[dict] | None = None,
+    ):
         self._aged_payables_total = aged_payables_total or {}
+        self._aged_payables_detail = aged_payables_detail or {}
+        self._aged_receivables_detail = aged_receivables_detail or {}
+        self._accounts = accounts or []
 
     def get_aged_payables_total(self, *, end_date: str):
         return self._aged_payables_total
+
+    def get_aged_payables_detail(self, *, end_date: str):
+        return self._aged_payables_detail
+
+    def get_aged_receivables_detail(self, *, end_date: str):
+        return self._aged_receivables_detail
+
+    def get_accounts(self, *, max_results: int = 1000):
+        return self._accounts
+
+
+def test_engine_inventory_accounts_must_exist_in_qbo_and_mer() -> None:
+    engine = MERBalanceSheetRuleEngine()
+
+    rulebook = {
+        "rules": [
+            {
+                "rule_id": "BS-BANK-AND-CC-INVENTORY-COVERAGE",
+                "title": "All bank/credit card accounts from maintenance sheet are included",
+                "requires_external_sources": ["client_maintenance_kyc", "mer_google_sheet"],
+                "evaluation": {"type": "inventory_accounts_must_exist_in_qbo_and_mer"},
+            }
+        ]
+    }
+
+    kyc_rows = [
+        ["Account Name", "Type"],
+        ["RBC Chequing", "Bank"],
+        ["Amex", "Credit Card"],
+    ]
+
+    mer_rows = [
+        ["Account", "Nov. 2025", "Comments"],
+        ["RBC Chequing", "123.00", ""],
+        ["Amex", "50.00", ""],
+    ]
+
+    ctx = MERBalanceSheetEvaluationContext(
+        end_date="2025-11-30",
+        mer_rows=mer_rows,
+        mer_selected_month_header="Nov. 2025",
+        mer_header_row_index=0,
+        client_maintenance_rows=kyc_rows,
+        qbo_balance_sheet_items=[],
+        qbo_client=_StubQBO(
+            accounts=[
+                {"Name": "RBC Chequing"},
+                {"Name": "Amex"},
+            ]
+        ),
+        zero_tolerance=Decimal("0.00"),
+        amount_match_tolerance=Decimal("0.00"),
+    )
+
+    res = engine.evaluate(rulebook=rulebook, ctx=ctx)
+    assert res[0]["status"] == "passed"
+
+    # Missing from MER should fail.
+    mer_rows_missing = [
+        ["Account", "Nov. 2025", "Comments"],
+        ["RBC Chequing", "123.00", ""],
+    ]
+    ctx2 = MERBalanceSheetEvaluationContext(
+        end_date="2025-11-30",
+        mer_rows=mer_rows_missing,
+        mer_selected_month_header="Nov. 2025",
+        mer_header_row_index=0,
+        client_maintenance_rows=kyc_rows,
+        qbo_balance_sheet_items=[],
+        qbo_client=_StubQBO(accounts=[{"Name": "RBC Chequing"}, {"Name": "Amex"}]),
+        zero_tolerance=Decimal("0.00"),
+        amount_match_tolerance=Decimal("0.00"),
+    )
+    res2 = engine.evaluate(rulebook=rulebook, ctx=ctx2)
+    assert res2[0]["status"] == "failed"
+
+
+def test_engine_inventory_accounts_prefers_qbo_xero_name_column() -> None:
+    engine = MERBalanceSheetRuleEngine()
+
+    rulebook = {
+        "rules": [
+            {
+                "rule_id": "BS-BANK-AND-CC-INVENTORY-COVERAGE",
+                "title": "All bank/credit card accounts from maintenance sheet are included",
+                "requires_external_sources": ["client_maintenance_kyc", "mer_google_sheet"],
+                "evaluation": {"type": "inventory_accounts_must_exist_in_qbo_and_mer"},
+            }
+        ]
+    }
+
+    # This mirrors the real template shape where statement names and QBO/Xero names are separate.
+    kyc_rows = [
+        [
+            "Company",
+            "Institution",
+            "Type",
+            "Account name on statement",
+            "Account name in [QBO/Xero]",
+        ],
+        ["ClientCo", "RBC", "Chequing", "RBC CHQ (statement)", "RBC Chequing 6338"],
+    ]
+
+    mer_rows = [
+        ["Account", "Nov. 2025", "Comments"],
+        ["RBC Chequing 6338", "123.00", ""],
+    ]
+
+    ctx = MERBalanceSheetEvaluationContext(
+        end_date="2025-11-30",
+        mer_rows=mer_rows,
+        mer_selected_month_header="Nov. 2025",
+        mer_header_row_index=0,
+        client_maintenance_rows=kyc_rows,
+        qbo_balance_sheet_items=[],
+        qbo_client=_StubQBO(accounts=[{"Name": "RBC Chequing 6338"}]),
+        zero_tolerance=Decimal("0.00"),
+        amount_match_tolerance=Decimal("0.00"),
+    )
+
+    res = engine.evaluate(rulebook=rulebook, ctx=ctx)
+    assert res[0]["status"] == "passed"
+
+
+def test_engine_qbo_aging_items_require_mer_comment_explanation_when_findings_exist() -> None:
+    engine = MERBalanceSheetRuleEngine()
+
+    rulebook = {
+        "rules": [
+            {
+                "rule_id": "BS-AP-AR-ITEMS-OLDER-THAN-60-DAYS",
+                "title": "AP/AR items older than 60 days flagged",
+                "evaluation": {"type": "qbo_aging_items_older_than_threshold_require_explanation"},
+                "parameters": {"max_age_days": 60},
+            }
+        ]
+    }
+
+    # Minimal shaped reports with one overdue item each.
+    # The extractor looks for bucket columns whose start-day > max_age_days.
+    ap_detail = {
+        "Columns": {
+            "Column": [
+                {"ColTitle": "Name"},
+                {"ColTitle": "Total"},
+                {"ColTitle": "61 - 90"},
+            ]
+        },
+        "Rows": {
+            "Row": [
+                {
+                    "ColData": [
+                        {"value": "Vendor A"},
+                        {"value": "100.00"},
+                        {"value": "10.00"},
+                    ]
+                }
+            ]
+        },
+    }
+    ar_detail = {
+        "Columns": {
+            "Column": [
+                {"ColTitle": "Name"},
+                {"ColTitle": "Total"},
+                {"ColTitle": "61 - 90"},
+            ]
+        },
+        "Rows": {
+            "Row": [
+                {
+                    "ColData": [
+                        {"value": "Customer A"},
+                        {"value": "200.00"},
+                        {"value": "20.00"},
+                    ]
+                }
+            ]
+        },
+    }
+
+    # No comments present on AP/AR lines -> should fail when findings exist.
+    rows = [
+        ["Account", "Nov. 2025", "Comments"],
+        ["Accounts Payable", "100.00", ""],
+        ["Accounts Receivable", "200.00", ""],
+    ]
+
+    ctx = MERBalanceSheetEvaluationContext(
+        end_date="2025-11-30",
+        mer_rows=rows,
+        mer_selected_month_header="Nov. 2025",
+        mer_header_row_index=0,
+        qbo_balance_sheet_items=[],
+        qbo_client=_StubQBO(aged_payables_detail=ap_detail, aged_receivables_detail=ar_detail),
+        zero_tolerance=Decimal("0.00"),
+        amount_match_tolerance=Decimal("0.00"),
+    )
+
+    res = engine.evaluate(rulebook=rulebook, ctx=ctx)
+    assert res[0]["status"] == "failed"
+
+    # Add explanations in MER comments -> should pass.
+    rows_with_comments = [
+        ["Account", "Nov. 2025", "Comments"],
+        ["Accounts Payable", "100.00", "Explained - waiting credit note"],
+        ["Accounts Receivable", "200.00", "Explained - dispute in progress"],
+    ]
+    ctx2 = MERBalanceSheetEvaluationContext(
+        end_date="2025-11-30",
+        mer_rows=rows_with_comments,
+        mer_selected_month_header="Nov. 2025",
+        mer_header_row_index=0,
+        qbo_balance_sheet_items=[],
+        qbo_client=_StubQBO(aged_payables_detail=ap_detail, aged_receivables_detail=ar_detail),
+        zero_tolerance=Decimal("0.00"),
+        amount_match_tolerance=Decimal("0.00"),
+    )
+
+    res2 = engine.evaluate(rulebook=rulebook, ctx=ctx2)
+    assert res2[0]["status"] == "passed"
 
 
 def test_engine_marks_unknown_eval_types_unimplemented() -> None:

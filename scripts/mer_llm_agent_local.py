@@ -457,6 +457,8 @@ def tool_mer_balance_sheet_review(
         parse_money,
         pick_latest_month_header,
     )
+    from src.backend.v4.use_cases.mer_rule_engine import MERBalanceSheetEvaluationContext
+    from src.backend.v4.use_cases.mer_rule_handlers import HANDLER_REGISTRY as BACKEND_HANDLERS
 
     _date.fromisoformat(end_date)
 
@@ -599,14 +601,37 @@ def tool_mer_balance_sheet_review(
     report = qbo.get_balance_sheet(end_date=end_date, start_date=end_date)
     qbo_items = extract_balance_sheet_items(report)
 
-    implemented_types = {
-        "balance_sheet_line_items_must_be_zero",
-        "mer_line_amount_matches_qbo_line_amount",
-        "mer_bank_balance_matches_qbo_bank_balance",
+    # Create evaluation context for backend handlers
+    eval_ctx = MERBalanceSheetEvaluationContext(
+        end_date=end_date,
+        mer_rows=rows,
+        mer_selected_month_header=selected_month,
+        mer_header_row_index=header_row_index,
+        qbo_balance_sheet_items=qbo_items,
+        qbo_client=qbo,
+        zero_tolerance=zero_tolerance,
+        amount_match_tolerance=amount_match_tolerance,
+    )
+
+    def _call_backend_handler(rule: dict, eval_type: str) -> dict | None:
+        """Call backend handler if available, returning result dict or None."""
+        handler = BACKEND_HANDLERS.get(eval_type)
+        if not handler:
+            return None
+        try:
+            result = handler(rule, eval_ctx)
+            return result
+        except Exception as e:
+            return {"status": "failed", "details": {"error": str(e)}}
+
+    # Backend-implemented + agent-only handlers
+    backend_handler_types = set(BACKEND_HANDLERS.keys())
+    agent_only_types = {
         "mer_credit_debit_accounts_book_balance_match_qbo",
         "qbo_report_total_matches_balance_sheet_line",
         "qbo_aging_items_older_than_threshold_require_explanation",
     }
+    implemented_types = backend_handler_types | agent_only_types
 
     results: list[dict] = []
 
@@ -718,6 +743,29 @@ def tool_mer_balance_sheet_review(
         if eval_type not in implemented_types:
             results.append({"rule_id": rule_id, "status": "unimplemented", "evaluation_type": eval_type})
             continue
+
+        # For handlers without line-level annotations, delegate directly to backend
+        backend_only_types = {
+            "requires_external_reconciliation_verification",
+            "needs_human_judgment",
+            "manual_process_required",
+            "needs_prior_cycle_context",
+            "mer_lines_require_link_to_support",
+            "support_link_presence_check",
+        }
+        if eval_type in backend_only_types:
+            handler_result = _call_backend_handler(rule, eval_type)
+            if handler_result:
+                results.append(
+                    {
+                        "rule_id": rule_id,
+                        "status": handler_result.get("status", "unimplemented"),
+                        "evaluation_type": eval_type,
+                        "evidence": _truncate_evidence(handler_result.get("details") or handler_result),
+                    }
+                )
+                continue
+            # Fall through if handler not found
 
         if eval_type == "balance_sheet_line_items_must_be_zero":
             substrings = (
@@ -999,10 +1047,16 @@ def tool_mer_balance_sheet_review(
 
         if eval_type == "mer_line_amount_matches_qbo_line_amount":
             mer_rule = (rule.get("applies_to") or {}).get("mer_line") or {}
+            # Support both singular and plural forms for flexibility
             qbo_rule = (rule.get("applies_to") or {}).get("qbo_balance_sheet_line") or {}
+            qbo_rules_plural = (rule.get("applies_to") or {}).get("qbo_balance_sheet_lines") or {}
 
             mer_row_key = mer_rule.get("row_key")
+            # Check singular first, then plural (label_contains_any)
             qbo_label = qbo_rule.get("label_contains")
+            if not qbo_label:
+                qbo_labels_any = qbo_rules_plural.get("label_contains_any") or []
+                qbo_label = str(qbo_labels_any[0]) if qbo_labels_any else None
 
             mer_matches = []
             if mer_row_key:
@@ -1022,6 +1076,22 @@ def tool_mer_balance_sheet_review(
                 qbo_amount=qbo_amount,
                 tolerance=amount_match_tolerance,
             )
+            
+            # Determine status and reason for summary annotation
+            if mer_amount is None and qbo_amount is None:
+                # Item not found in either system - mark as skipped/N/A
+                result_status = "skipped"
+                skip_reason = f"Item not found in MER or QBO (searched for '{qbo_label or mer_row_key}')"
+            elif mer_amount is None:
+                result_status = "skipped"
+                skip_reason = f"MER row not found (searched for '{mer_row_key}')"
+            elif qbo_amount is None:
+                result_status = "skipped"
+                skip_reason = f"QBO line not found (searched for '{qbo_label}')"
+            else:
+                result_status = "passed" if check.passed else "failed"
+                skip_reason = None
+            
             if mer_matches:
                 m = mer_matches[0]
                 delta = (mer_amount - qbo_amount) if mer_amount is not None and qbo_amount is not None else None
@@ -1029,7 +1099,7 @@ def tool_mer_balance_sheet_review(
                     m=m,
                     rule_id=str(rule_id),
                     evaluation_type=eval_type,
-                    status="passed" if check.passed else "failed",
+                    status=result_status,
                     note=f"MER={mer_amount} QBO={qbo_amount} Δ={delta}",
                     evidence={
                         "mer_a1_cell": m.a1_cell,
@@ -1044,24 +1114,33 @@ def tool_mer_balance_sheet_review(
                     },
                 )
             # Override check_id to the rule_id for reporting consistency
+            evidence_out = {**check.details, "check_id": str(rule_id)}
+            if skip_reason:
+                evidence_out["reason"] = skip_reason
             results.append(
                 {
                     "rule_id": rule_id,
-                    "status": "passed" if check.passed else "failed",
+                    "status": result_status,
                     "evaluation_type": eval_type,
-                    "evidence": _truncate_evidence({**check.details, "check_id": str(rule_id)}),
+                    "evidence": _truncate_evidence(evidence_out),
                 }
             )
             continue
 
         if eval_type == "mer_bank_balance_matches_qbo_bank_balance":
+            # First try applies_to, then fall back to parameters
             mer_bank_row_key = ((rule.get("applies_to") or {}).get("mer_line") or {}).get("row_key")
+            if not mer_bank_row_key:
+                mer_bank_row_key = (rule.get("parameters") or {}).get("mer_bank_row_key")
+            
             qbo_bank_substring = (
                 ((rule.get("applies_to") or {}).get("qbo_balance_sheet_lines") or {})
                 .get("label_contains_any")
                 or []
             )
             qbo_bank_sub = str(qbo_bank_substring[0]) if qbo_bank_substring else ""
+            if not qbo_bank_sub:
+                qbo_bank_sub = str((rule.get("parameters") or {}).get("qbo_bank_label_substring") or "")
 
             mer_matches = []
             if mer_bank_row_key:
@@ -1081,6 +1160,20 @@ def tool_mer_balance_sheet_review(
                 qbo_amount=qbo_amount,
                 tolerance=amount_match_tolerance,
             )
+            
+            # Determine status and reason for summary annotation
+            if mer_amount is None and qbo_amount is None:
+                result_status = "skipped"
+                skip_reason = f"Item not found in MER or QBO (searched for '{mer_bank_row_key}' / '{qbo_bank_sub}')"
+            elif mer_amount is None:
+                result_status = "skipped"
+                skip_reason = f"MER row not found (searched for '{mer_bank_row_key}')"
+            elif qbo_amount is None:
+                result_status = "skipped"
+                skip_reason = f"QBO line not found (searched for '{qbo_bank_sub}')"
+            else:
+                result_status = "passed" if check.passed else "failed"
+                skip_reason = None
 
             if mer_matches:
                 m = mer_matches[0]
@@ -1089,7 +1182,7 @@ def tool_mer_balance_sheet_review(
                     m=m,
                     rule_id=str(rule_id),
                     evaluation_type=eval_type,
-                    status="passed" if check.passed else "failed",
+                    status=result_status,
                     note=f"MER={mer_amount} QBO={qbo_amount} Δ={delta}",
                     evidence={
                         "mer_a1_cell": m.a1_cell,
@@ -1104,12 +1197,15 @@ def tool_mer_balance_sheet_review(
                     },
                 )
 
+            evidence_out = {**check.details}
+            if skip_reason:
+                evidence_out["reason"] = skip_reason
             results.append(
                 {
                     "rule_id": rule_id,
-                    "status": "passed" if check.passed else "failed",
+                    "status": result_status,
                     "evaluation_type": eval_type,
-                    "evidence": _truncate_evidence(check.details),
+                    "evidence": _truncate_evidence(evidence_out),
                 }
             )
             continue
@@ -1425,7 +1521,7 @@ def tool_mer_balance_sheet_review(
             },
         )
 
-    # Optional: write annotations to the configured column (default: P).
+    # Optional: write annotations to the configured column (default: H).
     wrote_sheet_annotations: dict | None = None
     if os.environ.get("MER_AGENT_WRITE_SHEET_ANNOTATIONS", "").strip() == "1":
         if header_row_index is None:
@@ -1449,6 +1545,9 @@ def tool_mer_balance_sheet_review(
         )
 
         updates: dict[str, str] = {f"'{sheet}'!{annotation_col_letter}{header_row_num}": header_value}
+        
+        # Track which rows have line-level annotations
+        rows_with_annotations: set[int] = set()
         for lr in line_results:
             text = (lr.get("sheet_annotation") or "").strip()
             if not text:
@@ -1458,12 +1557,81 @@ def tool_mer_balance_sheet_review(
                 continue
             row_num = mer_row_index + 1
             updates[f"'{sheet}'!{annotation_col_letter}{row_num}"] = text
+            rows_with_annotations.add(mer_row_index)
+
+        # Find the last row of the balance sheet data
+        last_data_row_index = len(rows) - 1
+        # Walk backward to find the last non-empty row
+        while last_data_row_index > header_row_index:
+            row_data = rows[last_data_row_index] if last_data_row_index < len(rows) else []
+            if any((c or "").strip() for c in row_data):
+                break
+            last_data_row_index -= 1
+
+        # Collect rules that don't correspond to any specific line (summary-level checks)
+        # These are rules whose results don't have row mappings in line_results_by_row
+        rules_with_line_mappings: set[str] = set()
+        for lr in line_results:
+            for check in (lr.get("checks") or []):
+                rules_with_line_mappings.add(str(check.get("rule_id") or ""))
+
+        summary_annotations: list[str] = []
+        for r in results:
+            rule_id = str(r.get("rule_id") or "")
+            status = str(r.get("status") or "")
+            eval_type = str(r.get("evaluation_type") or "")
+            
+            # Skip unimplemented or rules that already have line-level annotations
+            if status == "unimplemented" or rule_id in rules_with_line_mappings:
+                continue
+            
+            # Build summary annotation for this rule
+            if status == "passed":
+                summary_annotations.append(f"PASS: {rule_id}")
+            elif status == "failed":
+                evidence = r.get("evidence") or {}
+                note = ""
+                if isinstance(evidence, dict):
+                    note = str(evidence.get("reason") or evidence.get("note") or evidence.get("rule") or "").strip()
+                if note:
+                    summary_annotations.append(f"FAIL: {rule_id} — {note[:200]}")
+                else:
+                    summary_annotations.append(f"FAIL: {rule_id}")
+            elif status == "skipped":
+                evidence = r.get("evidence") or {}
+                reason = ""
+                if isinstance(evidence, dict):
+                    reason = str(evidence.get("reason") or "").strip()
+                if reason:
+                    summary_annotations.append(f"SKIP: {rule_id} — {reason[:150]}")
+                else:
+                    summary_annotations.append(f"SKIP: {rule_id}")
+            elif status == "needs_human_review":
+                evidence = r.get("evidence") or {}
+                action = ""
+                if isinstance(evidence, dict):
+                    action = str(evidence.get("action") or evidence.get("reason") or "").strip()
+                if action:
+                    summary_annotations.append(f"REVIEW: {rule_id} — {action[:150]}")
+                else:
+                    summary_annotations.append(f"REVIEW: {rule_id}")
+
+        # Write summary annotations starting from the row after the last data row
+        if summary_annotations:
+            summary_start_row = last_data_row_index + 3  # Leave a blank row for spacing
+            # Add a summary header
+            updates[f"'{sheet}'!{annotation_col_letter}{summary_start_row}"] = f"--- MER Summary ({end_date}) ---"
+            for i, annotation in enumerate(summary_annotations):
+                row_num = summary_start_row + 1 + i
+                updates[f"'{sheet}'!{annotation_col_letter}{row_num}"] = annotation
 
         # Guarded inside the integration by GOOGLE_SHEETS_ALLOW_WRITE=1.
         wrote_sheet_annotations = {
             "annotation_col_letter": annotation_col_letter,
             "annotation_col_index": annotation_col_index,
             "updated_cells": len(updates),
+            "line_annotations": len(rows_with_annotations),
+            "summary_annotations": len(summary_annotations),
             "response": reader.batch_update_values(updates=updates),
         }
 
@@ -1472,6 +1640,7 @@ def tool_mer_balance_sheet_review(
     failed = sum(1 for r in results if r.get("status") == "failed")
     unimplemented = sum(1 for r in results if r.get("status") == "unimplemented")
     skipped = sum(1 for r in results if r.get("status") == "skipped")
+    needs_review = sum(1 for r in results if r.get("status") == "needs_human_review")
     max_failed = int(os.environ.get("MER_AGENT_FAILED_RULES_LIMIT", "10"))
     failed_results = [
         {
@@ -1527,6 +1696,7 @@ def tool_mer_balance_sheet_review(
         "summary": {
             "passed": passed,
             "failed": failed,
+            "needs_human_review": needs_review,
             "unimplemented": unimplemented,
             "skipped": skipped,
             "total_considered": len(results),
