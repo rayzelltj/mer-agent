@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Type
 
 from src.backend.v4.models import messages as messages
 
-from ..models.messages_af import (
+from src.backend.common.models.messages_af import (
     AgentMessageData,
     BaseDataModel,
     CurrentTeamAgent,

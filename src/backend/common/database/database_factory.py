@@ -5,8 +5,8 @@ from typing import Optional
 
 from src.backend.common.config.app_config import config
 
-from .cosmosdb import CosmosDBClient
-from .database_base import DatabaseBase
+from src.backend.common.database.cosmosdb import CosmosDBClient
+from src.backend.common.database.database_base import DatabaseBase
 
 
 class DatabaseFactory:

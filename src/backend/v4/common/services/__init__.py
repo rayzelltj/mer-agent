@@ -6,10 +6,10 @@ Exports:
 - FoundryService: helper around Azure AI Foundry (AIProjectClient)
 """
 
-from .agents_service import AgentsService
-from .base_api_service import BaseAPIService
-from .foundry_service import FoundryService
-from .mcp_service import MCPService
+from src.backend.v4.common.services.agents_service import AgentsService
+from src.backend.v4.common.services.base_api_service import BaseAPIService
+from src.backend.v4.common.services.foundry_service import FoundryService
+from src.backend.v4.common.services.mcp_service import MCPService
 
 __all__ = [
     "BaseAPIService",

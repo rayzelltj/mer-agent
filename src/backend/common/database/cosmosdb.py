@@ -8,7 +8,7 @@ from src.backend.v4.models import messages as messages
 from azure.cosmos.aio import CosmosClient
 from azure.cosmos.aio._database import DatabaseProxy
 
-from ..models.messages_af import (
+from src.backend.common.models.messages_af import (
     AgentMessage,
     AgentMessageData,
     BaseDataModel,
@@ -19,7 +19,7 @@ from ..models.messages_af import (
     TeamConfiguration,
     UserCurrentTeam,
 )
-from .database_base import DatabaseBase
+from src.backend.common.database.database_base import DatabaseBase
 
 
 class CosmosDBClient(DatabaseBase):

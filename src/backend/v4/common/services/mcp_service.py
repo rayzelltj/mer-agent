@@ -2,7 +2,7 @@ from typing import Any, Dict, Optional
 
 from common.config.app_config import config
 
-from .base_api_service import BaseAPIService
+from src.backend.v4.common.services.base_api_service import BaseAPIService
 
 
 class MCPService(BaseAPIService):
