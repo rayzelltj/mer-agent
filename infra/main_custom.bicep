@@ -1514,6 +1514,10 @@ module containerAppMcp 'br/public:avm/res/app/container-app:0.18.1' = {
             name: 'DATASET_PATH'
             value: './datasets'
           }
+          {
+            name: 'MER_REVIEW_BACKEND_BASE_URL'
+            value: 'https://${containerApp.outputs.fqdn}/api/v4'
+          }
         ]
       }
     ]
@@ -1932,4 +1936,3 @@ output AZURE_AI_SEARCH_INDEX_NAME_CONTRACT_COMPLIANCE string = aiSearchIndexName
 // Container Registry Outputs
 output AZURE_CONTAINER_REGISTRY_ENDPOINT string = containerRegistry.outputs.loginServer
 output AZURE_CONTAINER_REGISTRY_NAME string = containerRegistry.outputs.name
-
