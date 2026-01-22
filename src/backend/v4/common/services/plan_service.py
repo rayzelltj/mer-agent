@@ -146,11 +146,15 @@ class PlanService:
                     orchestration_config.plans[human_feedback.m_plan_id],
                 )
                 if human_feedback.approved:
+                    if human_feedback.plan_id is None:
+                        print("Plan ID is None, cannot approve.")
+                        return False
                     plan = await memory_store.get_plan(human_feedback.plan_id)
                     mplan.plan_id = human_feedback.plan_id
-                    mplan.team_id = plan.team_id  # just to keep consistency
-                    orchestration_config.plans[human_feedback.m_plan_id] = mplan
                     if plan:
+                        if plan.team_id is not None:
+                            mplan.team_id = plan.team_id
+                        orchestration_config.plans[human_feedback.m_plan_id] = mplan
                         plan.overall_status = PlanStatus.approved
                         plan.m_plan = mplan.model_dump()
                         await memory_store.update_plan(plan)
@@ -166,6 +170,9 @@ class PlanService:
                         print("Plan not found in memory store.")
                         return False
                 else:  # reject plan
+                    if human_feedback.plan_id is None:
+                        print("Plan ID is None, cannot reject.")
+                        return False
                     track_event_if_configured(
                         "PlanRejected",
                         {
@@ -209,9 +216,12 @@ class PlanService:
             await memory_store.add_agent_message(agent_msg)
             if agent_message.is_final:
                 plan = await memory_store.get_plan(agent_msg.plan_id)
-                plan.streaming_message = agent_message.streaming_message
-                plan.overall_status = PlanStatus.completed
-                await memory_store.update_plan(plan)
+                if plan:
+                    plan.streaming_message = agent_message.streaming_message
+                    plan.overall_status = PlanStatus.completed
+                    await memory_store.update_plan(plan)
+                else:
+                    print("Plan not found for final message.")
             return True
         except Exception as e:
             logger.exception(

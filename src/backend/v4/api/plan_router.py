@@ -33,7 +33,7 @@ plan_router = APIRouter(tags=["Plans"])
 
 
 # ---------------------------------------------------------------------------
-# Endpoints (InputTask imported from common.models.messages_af)
+# Endpoints (InputTask imported from src.backend.common.models.messages_af)
 # ---------------------------------------------------------------------------
 
 

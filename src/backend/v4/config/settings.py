@@ -8,8 +8,8 @@ import json
 import logging
 from typing import Dict, Optional, Any
 
-from common.config.app_config import config
-from common.models.messages_af import TeamConfiguration
+from src.backend.common.config.app_config import config
+from src.backend.common.models.messages_af import TeamConfiguration
 from fastapi import WebSocket
 
 # agent_framework substitutes
@@ -17,7 +17,7 @@ from agent_framework.azure import AzureOpenAIChatClient
 # from agent_framework_azure_ai import AzureOpenAIChatClient
 from agent_framework import ChatOptions
 
-from v4.models.messages import MPlan, WebsocketMessageType
+from src.backend.v4.models.messages import MPlan, WebsocketMessageType
 
 logger = logging.getLogger(__name__)
 

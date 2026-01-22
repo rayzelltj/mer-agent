@@ -1,11 +1,11 @@
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, cast
 
 # from git import List
 import aiohttp
 from azure.ai.projects.aio import AIProjectClient
-from common.config.app_config import config
+from src.backend.common.config.app_config import config
 
 
 class FoundryService:
@@ -27,14 +27,17 @@ class FoundryService:
 
     async def get_client(self) -> AIProjectClient:
         if self._client is None:
-            self._client = config.get_ai_project_client()
+            self._client = cast(AIProjectClient, config.get_ai_project_client())
         return self._client
 
     # Example convenience wrappers – adjust as your project needs evolve
     async def list_connections(self) -> list[Dict[str, Any]]:
         client = await self.get_client()
-        conns = await client.connections.list()
-        return [c.as_dict() if hasattr(c, "as_dict") else dict(c) for c in conns]
+        conns = client.connections.list()
+        result = []
+        async for c in conns:
+            result.append(c.as_dict() if hasattr(c, "as_dict") else dict(c))
+        return result
 
     async def get_connection(self, name: str) -> Dict[str, Any]:
         client = await self.get_client()

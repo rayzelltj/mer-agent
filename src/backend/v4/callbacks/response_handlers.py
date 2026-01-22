@@ -11,10 +11,12 @@ from typing import Any
 from agent_framework import ChatMessage
 # Removed: from agent_framework._content import FunctionCallContent  (does not exist)
 
-from agent_framework._workflows._magentic import AgentRunResponseUpdate  # Streaming update type from workflows
+# from agent_framework._workflows._magentic import AgentRunResponseUpdate  # Streaming update type from workflows
+# from agent_framework import AgentRunResponseUpdate
 
-from v4.config.settings import connection_config
-from v4.models.messages import (
+
+from src.backend.v4.config.settings import connection_config
+from src.backend.v4.models.messages import (
     AgentMessage,
     AgentMessageStreaming,
     AgentToolCall,
@@ -94,7 +96,7 @@ def agent_response_callback(
     try:
         final_message = AgentMessage(
             agent_name=agent_name,
-            timestamp=time.time(),
+            timestamp=str(time.time()),
             content=text,
         )
         asyncio.create_task(
@@ -111,7 +113,7 @@ def agent_response_callback(
 
 async def streaming_agent_response_callback(
     agent_id: str,
-    update: AgentRunResponseUpdate,
+    update,
     is_final: bool,
     user_id: str | None = None,
 ) -> None:

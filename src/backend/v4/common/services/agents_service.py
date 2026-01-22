@@ -12,8 +12,8 @@ agent instances.
 import logging
 from typing import Any, Dict, List, Union
 
-from common.models.messages_af import TeamAgent, TeamConfiguration
-from v4.common.services.team_service import TeamService
+from src.backend.common.models.messages_af import TeamAgent, TeamConfiguration
+from src.backend.v4.common.services.team_service import TeamService
 
 
 class AgentsService:
@@ -57,7 +57,7 @@ class AgentsService:
 
         # Accept either the pydantic TeamConfiguration or a raw dictionary
         if hasattr(team_config, "agents"):
-            agents_raw = team_config.agents or []
+            agents_raw = getattr(team_config, "agents", None) or []
         elif isinstance(team_config, dict):
             agents_raw = team_config.get("agents", [])
         else:

@@ -1,6 +1,6 @@
 from typing import Any, Dict, Optional
 
-from common.config.app_config import config
+from src.backend.common.config.app_config import config
 
 from src.backend.v4.common.services.base_api_service import BaseAPIService
 
@@ -19,7 +19,7 @@ class MCPService(BaseAPIService):
         super().__init__(base_url, default_headers=headers, **kwargs)
 
     @classmethod
-    def from_app_config(cls, **kwargs) -> "MCPService":
+    def from_app_config(cls, **kwargs) -> Optional["MCPService"]:
         # Prefer explicit MCP endpoint if defined; otherwise use the v4 settings default.
         endpoint = config.MCP_SERVER_ENDPOINT
         if not endpoint:

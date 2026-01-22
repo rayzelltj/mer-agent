@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from common.config.app_config import config
+from src.backend.common.config.app_config import config
 
 
 @dataclass(slots=True)

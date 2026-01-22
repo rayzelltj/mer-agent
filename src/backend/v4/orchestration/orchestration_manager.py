@@ -39,20 +39,20 @@ MagenticAgentDeltaEvent = _af_attr("MagenticAgentDeltaEvent")
 MagenticAgentMessageEvent = _af_attr("MagenticAgentMessageEvent")
 MagenticFinalResultEvent = _af_attr("MagenticFinalResultEvent")
 
-from common.config.app_config import config
-from common.models.messages_af import TeamConfiguration
+from src.backend.common.config.app_config import config
+from src.backend.common.models.messages_af import TeamConfiguration
 
-from common.database.database_base import DatabaseBase
+from src.backend.common.database.database_base import DatabaseBase
 
-from v4.common.services.team_service import TeamService
-from v4.callbacks.response_handlers import (
+from src.backend.v4.common.services.team_service import TeamService
+from src.backend.v4.callbacks.response_handlers import (
     agent_response_callback,
     streaming_agent_response_callback,
 )
-from v4.config.settings import connection_config, orchestration_config
-from v4.models.messages import WebsocketMessageType
-from v4.orchestration.human_approval_manager import HumanApprovalMagenticManager
-from v4.magentic_agents.magentic_agent_factory import MagenticAgentFactory
+from src.backend.v4.config.settings import connection_config, orchestration_config
+from src.backend.v4.models.messages import WebsocketMessageType
+from src.backend.v4.orchestration.human_approval_manager import HumanApprovalMagenticManager
+from src.backend.v4.magentic_agents.magentic_agent_factory import MagenticAgentFactory
 
 
 class OrchestrationManager:
@@ -158,10 +158,12 @@ class OrchestrationManager:
                 cls.logger.debug("Added participant '%s'", name)
 
         # Assemble workflow with callback
+        if MagenticBuilder is object:
+            raise RuntimeError("MagenticBuilder is not available (agent_framework import failed). Check your dependencies.")
         storage = InMemoryCheckpointStorage()
         builder = (
             MagenticBuilder()
-            .participants(**participants)
+            .participants(**participants) # type: ignore
             .with_standard_manager(
                 manager=manager,
                 max_round_count=orchestration_config.max_rounds,
@@ -188,7 +190,7 @@ class OrchestrationManager:
         user_id: str,
         team_config: TeamConfiguration,
         team_switched: bool,
-        team_service: TeamService = None,
+        team_service: TeamService | None = None,
     ):
         """
         Return an existing workflow for the user or create a new one if:
@@ -210,17 +212,22 @@ class OrchestrationManager:
                         close_coro = getattr(agent, "close", None)
                         if callable(close_coro):
                             try:
-                                await close_coro()
+                                await close_coro() # type: ignore
                                 cls.logger.debug("Closed agent '%s'", agent_name)
                             except Exception as e:
                                 cls.logger.error("Error closing agent: %s", e)
 
             factory = MagenticAgentFactory(team_service=team_service)
             try:
+                if team_service is None:
+                    raise ValueError("team_service is required to create agents.")
+                memory_context = getattr(team_service, "memory_context", None)
+                if memory_context is None:
+                    raise ValueError("team_service.memory_context is required and cannot be None.")
                 agents = await factory.get_agents(
                     user_id=user_id,
                     team_config_input=team_config,
-                    memory_store=team_service.memory_context,
+                    memory_store=memory_context,
                 )
                 cls.logger.info("Created %d agents for user '%s'", len(agents), user_id)
             except Exception as e:
@@ -233,7 +240,7 @@ class OrchestrationManager:
                 cls.logger.info("Initializing new orchestration for user '%s'", user_id)
                 orchestration_config.orchestrations[user_id] = (
                     await cls.init_orchestration(
-                        agents, team_config, team_service.memory_context, user_id
+                        agents, team_config, memory_context, user_id
                     )
                 )
             except Exception as e:

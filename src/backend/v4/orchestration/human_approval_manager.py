@@ -7,7 +7,7 @@ import asyncio
 import logging
 from typing import Any, Optional
 
-import v4.models.messages as messages
+import src.backend.v4.models.messages as messages
 from agent_framework import ChatMessage
 from agent_framework._workflows._magentic import (
     MagenticContext,
@@ -17,10 +17,10 @@ from agent_framework._workflows._magentic import (
     ORCHESTRATOR_TASK_LEDGER_PLAN_UPDATE_PROMPT,
 )
 
-from v4.config.settings import connection_config, orchestration_config
-from v4.models.models import MPlan
-from v4.models.models import PlanStatus
-from v4.orchestration.helper.plan_to_mplan_converter import PlanToMPlanConverter
+from src.backend.v4.config.settings import connection_config, orchestration_config
+from src.backend.v4.models.models import MPlan
+from src.backend.v4.models.models import PlanStatus
+from src.backend.v4.orchestration.helper.plan_to_mplan_converter import PlanToMPlanConverter
 
 logger = logging.getLogger(__name__)
 

@@ -19,15 +19,15 @@ except Exception as exc:  # pragma: no cover
     _AZURE_AI_IMPORT_ERROR = exc
 from azure.ai.agents.aio import AgentsClient
 from azure.identity.aio import DefaultAzureCredential
-from common.database.database_base import DatabaseBase
-from common.models.messages_af import CurrentTeamAgent, TeamConfiguration
-from common.utils.utils_agents import (
+from src.backend.common.database.database_base import DatabaseBase
+from src.backend.common.models.messages_af import CurrentTeamAgent, TeamConfiguration
+from src.backend.common.utils.utils_agents import (
     generate_assistant_id,
     get_database_team_agent_id,
 )
-from v4.common.services.team_service import TeamService
-from v4.config.agent_registry import agent_registry
-from v4.magentic_agents.models.agent_models import MCPConfig
+from src.backend.v4.common.services.team_service import TeamService
+from src.backend.v4.config.agent_registry import agent_registry
+from src.backend.v4.magentic_agents.models.agent_models import MCPConfig
 
 
 class MCPEnabledBase:

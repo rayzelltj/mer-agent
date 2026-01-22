@@ -10,46 +10,48 @@
   "logo": "",
   "plan": "",
   "agents": [
-    {
-      "input_key": "",
-      "type": "",
-      "name": "MERReviewOrchestrator",
-      "deployment_name": "gpt-4.1-mini",
-      "icon": "",
-      "system_message": "You are the MER Review Orchestrator for Enkel. Your job is to run a Balance Sheet review for a given period end date and produce a concise reviewer-style output based on tool results.\n\nRules:\n- Do NOT make assumptions. If the user does not provide a required input (especially the period end date), ask the ProxyAgent for clarification.\n- The MER Google Sheet is the review artifact. Never edit the MER sheet.\n- Prefer deterministic outputs over narrative speculation.\n- To run the checks, call the MCP tool `mer_balance_sheet_review` with end_date (YYYY-MM-DD). Optionally pass mer_sheet/mer_range/mer_month_header and bank-match parameters if supplied by the user.\n\nOutput format:\n1) Summary: how many rules passed/failed/unimplemented.\n2) Failed checks: list each failed rule_id with the key evidence fields returned.\n3) Requires clarification: if the tool returns `requires_clarification`, surface it verbatim and stop (do not invent defaults).\n4) Next actions: minimal, concrete steps for a human reviewer.",
-      "description": "Coordinates MER Balance Sheet review by calling the MER review tool and summarizing deterministic results.",
-      "use_rag": false,
-      "use_mcp": true,
-      "use_bing": false,
-      "use_reasoning": false,
-      "index_name": "",
-      "index_foundry_name": "",
-      "index_endpoint": "",
-      "coding_tools": false
-    },
-    {
-      "input_key": "",
-      "type": "",
-      "name": "ProxyAgent",
-      "deployment_name": "",
-      "icon": "",
-      "system_message": "",
-      "description": "",
-      "use_rag": false,
-      "use_mcp": false,
-      "use_bing": false,
-      "use_reasoning": false,
-      "index_name": "",
-      "index_foundry_name": "",
-      "coding_tools": false
-    }
-  ],
+  {
+    "input_key": "",
+    "type": "orchestrator",
+    "name": "MERReviewOrchestrator",
+    "deployment_name": "gpt-4.1-mini",
+    "icon": "",
+    "system_message": "You are the MER Review Orchestrator for Enkel...",
+    "use_rag": false,
+    "use_mcp": true,
+    "use_bing": false,
+    "use_reasoning": false,
+    "coding_tools": false
+  },
+  {
+    "input_key": "",
+    "type": "proxy",
+    "name": "ProxyAgent",
+    "deployment_name": "gpt-4.1-mini",
+    "icon": "",
+    "system_message": "You ask the user for missing inputs such as company name or period end date and pass them to the orchestrator.",
+    "use_rag": false,
+    "use_mcp": false,
+    "use_bing": false,
+    "use_reasoning": false,
+    "coding_tools": false
+  }
+]
+,
   "protected": false,
   "starting_tasks": [
     {
       "id": "task-1",
-      "name": "MER Balance Sheet Review",
-      "prompt": "Review the MER Balance Sheet for period end 2025-12-31. Run the deterministic checks using the MER rulebook and return a concise summary with evidence.",
+      "name": "MER Balance Sheet Review - Blackbird Fabrics",
+      "prompt": "Review the MER Balance Sheet for Blackbird Fabrics as of 2025-11-20. Run the deterministic checks using the MER rulebook and return a concise summary with evidence. Include pass/fail results and any required actions.",
+      "created": "",
+      "creator": "",
+      "logo": ""
+    },
+    {
+      "id": "task-2", 
+      "name": "Custom MER Review",
+      "prompt": "I need to perform an MER balance sheet review. Please ask me for the company name and period end date, then run the review using the mer_balance_sheet_review tool.",
       "created": "",
       "creator": "",
       "logo": ""

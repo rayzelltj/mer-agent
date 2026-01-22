@@ -6,6 +6,7 @@ from typing import Optional
 from azure.ai.projects.aio import AIProjectClient
 from azure.cosmos import CosmosClient
 from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
+from azure.identity.aio import DefaultAzureCredential as AsyncDefaultAzureCredential, ManagedIdentityCredential as AsyncManagedIdentityCredential
 from dotenv import load_dotenv
 
 
@@ -123,7 +124,7 @@ class AppConfig:
             Credential object: Either DefaultAzureCredential or ManagedIdentityCredential.
         """
         if self.APP_ENV == "dev":
-            return DefaultAzureCredential()  # CodeQL [SM05139]: DefaultAzureCredential is safe here
+            return DefaultAzureCredential()  # Use sync version for CosmosClient
         else:
             return ManagedIdentityCredential(client_id=client_id)
 
@@ -218,7 +219,7 @@ class AppConfig:
             )
             raise
 
-    def get_ai_project_client(self):
+    async def get_ai_project_client(self):
         """Create and return an AIProjectClient for Azure AI Foundry using from_connection_string.
 
         Returns:
@@ -228,7 +229,10 @@ class AppConfig:
             return self._ai_project_client
 
         try:
-            credential = self.get_azure_credential(self.AZURE_CLIENT_ID)
+            if self.APP_ENV == "dev":
+                credential = AsyncDefaultAzureCredential()
+            else:
+                credential = AsyncManagedIdentityCredential(client_id=self.AZURE_CLIENT_ID)
             if credential is None:
                 raise RuntimeError(
                     "Unable to acquire Azure credentials; ensure Managed Identity is configured"

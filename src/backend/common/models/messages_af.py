@@ -192,7 +192,7 @@ class TeamConfiguration(BaseDataModel):
     """Represents a team configuration stored in the database."""
     team_id: str
     data_type: Literal[DataType.team_config] = DataType.team_config
-    session_id: str  # partition key
+    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))  # partition key
     name: str
     status: str
     created: str
@@ -212,7 +212,7 @@ class PlanWithSteps(Plan):
     total_steps: int = 0
     planned: int = 0
     awaiting_feedback: int = 0
-    approved: int = 0
+    approved_count: int = 0
     rejected: int = 0
     action_requested: int = 0
     completed: int = 0
@@ -235,7 +235,7 @@ class PlanWithSteps(Plan):
         self.total_steps = len(self.steps)
         self.planned = status_counts[StepStatus.planned]
         self.awaiting_feedback = status_counts[StepStatus.awaiting_feedback]
-        self.approved = status_counts[StepStatus.approved]
+        self.approved_count = status_counts[StepStatus.approved]
         self.rejected = status_counts[StepStatus.rejected]
         self.action_requested = status_counts[StepStatus.action_requested]
         self.completed = status_counts[StepStatus.completed]

@@ -6,15 +6,15 @@ import logging
 from types import SimpleNamespace
 from typing import List, Optional, Union
 
-from common.config.app_config import config
-from common.database.database_base import DatabaseBase
-from common.models.messages_af import TeamConfiguration
-from v4.common.services.team_service import TeamService
-from v4.magentic_agents.foundry_agent import FoundryAgentTemplate
-from v4.magentic_agents.models.agent_models import MCPConfig, SearchConfig
+from src.backend.common.config.app_config import config
+from src.backend.common.database.database_base import DatabaseBase
+from src.backend.common.models.messages_af import TeamConfiguration
+from src.backend.v4.common.services.team_service import TeamService
+from src.backend.v4.magentic_agents.foundry_agent import FoundryAgentTemplate
+from src.backend.v4.magentic_agents.models.agent_models import MCPConfig, SearchConfig
 # from v4.magentic_agents.models.agent_models import (BingConfig, MCPConfig,
 #                                                     SearchConfig)
-from v4.magentic_agents.proxy_agent import ProxyAgent
+from src.backend.v4.magentic_agents.proxy_agent import ProxyAgent
 
 
 class UnsupportedModelError(Exception):

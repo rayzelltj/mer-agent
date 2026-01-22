@@ -131,6 +131,53 @@ def _explicit_tool_directive(prompt: str, tool_name: str) -> bool:
     return re.search(rf"\bcall\s+{re.escape(tool_name)}\b", prompt, flags=re.IGNORECASE) is not None
 
 
+def _extract_company_and_date(prompt: str) -> tuple[Optional[str], Optional[str]]:
+    """Extract company name and date from MER review prompts."""
+    company = None
+    date = None
+
+    # Look for company names (simple patterns)
+    company_patterns = [
+        r"for\s+([A-Za-z\s]+?)(?:\s+as\s+of|\s+period|\s+ending|\s*$)",
+        r"([A-Za-z\s]+?)\s+(?:balance\s+sheet|financials|mer\s+review)",
+    ]
+
+    for pattern in company_patterns:
+        match = re.search(pattern, prompt, re.IGNORECASE)
+        if match:
+            company = match.group(1).strip()
+            break
+
+    # Look for dates
+    date_patterns = [
+        r"(\d{4}-\d{2}-\d{2})",  # YYYY-MM-DD
+        r"(\d{2}/\d{2}/\d{4})",  # MM/DD/YYYY
+        r"(?:as\s+of|period\s+end(?:ing)?)\s+(\w+\s+\d{1,2},?\s+\d{4})",  # "as of November 20, 2025"
+    ]
+
+    for pattern in date_patterns:
+        match = re.search(pattern, prompt, re.IGNORECASE)
+        if match:
+            date_str = match.group(1)
+            # Try to normalize to YYYY-MM-DD
+            try:
+                if "/" in date_str:
+                    # MM/DD/YYYY -> YYYY-MM-DD
+                    parts = date_str.split("/")
+                    date = f"{parts[2]}-{parts[0].zfill(2)}-{parts[1].zfill(2)}"
+                elif len(date_str.split()) == 3:
+                    # "November 20, 2025" -> "2025-11-20"
+                    date_obj = datetime.strptime(date_str.replace(",", ""), "%B %d %Y")
+                    date = date_obj.strftime("%Y-%m-%d")
+                else:
+                    date = date_str
+                break
+            except:
+                continue
+
+    return company, date
+
+
 def _clip(s: str, max_len: int) -> str:
     if max_len >= 0 and len(s) > max_len:
         return s[:max_len] + "…"
@@ -2428,6 +2475,17 @@ def main() -> int:
     ap.add_argument("--max-steps", type=int, default=6)
 
     args = ap.parse_args()
+
+    # Preprocess the prompt to extract MER-specific information
+    company, date = _extract_company_and_date(args.prompt)
+    if company or date:
+        print(f"📊 MER Review Request Detected:")
+        if company:
+            print(f"   Company: {company}")
+        if date:
+            print(f"   Period End Date: {date}")
+        print(f"   This will trigger the mer_balance_sheet_review tool")
+        print()
 
     try:
         out = asyncio.run(run_agent(args.prompt, max_steps=args.max_steps))

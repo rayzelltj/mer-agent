@@ -16,8 +16,8 @@ import uuid
 from typing import Any, AsyncIterable
 
 from agent_framework import (
-    AgentRunResponse,
-    AgentRunResponseUpdate,
+    AgentResponse,  # type: ignore
+    AgentResponseUpdate,  # type: ignore
     BaseAgent,
     ChatMessage,
     Role,
@@ -27,8 +27,8 @@ from agent_framework import (
     AgentThread,
 )
 
-from v4.config.settings import connection_config, orchestration_config
-from v4.models.messages import (
+from src.backend.v4.config.settings import connection_config, orchestration_config
+from src.backend.v4.models.messages import (
     UserClarificationRequest,
     UserClarificationResponse,
     TimeoutNotification,
@@ -88,7 +88,7 @@ class ProxyAgent(BaseAgent):
         *,
         thread: AgentThread | None = None,
         **kwargs: Any,
-    ) -> AgentRunResponse:
+    ) -> AgentResponse:
         """
         Get complete clarification response (non-streaming).
 
@@ -113,7 +113,7 @@ class ProxyAgent(BaseAgent):
                     )
                 )
 
-        return AgentRunResponse(
+        return AgentResponse(
             messages=response_messages,
             response_id=response_id,
         )
@@ -124,7 +124,7 @@ class ProxyAgent(BaseAgent):
         *,
         thread: AgentThread | None = None,
         **kwargs: Any,
-    ) -> AsyncIterable[AgentRunResponseUpdate]:
+    ) -> AsyncIterable[AgentResponseUpdate]:
         """
         Stream clarification process with human interaction.
 
@@ -143,13 +143,13 @@ class ProxyAgent(BaseAgent):
         messages: str | ChatMessage | list[str] | list[ChatMessage] | None,
         thread: AgentThread | None,
         **kwargs: Any,
-    ) -> AsyncIterable[AgentRunResponseUpdate]:
+    ) -> AsyncIterable[AgentResponseUpdate]:
         """
         Internal streaming implementation.
 
         1. Sends clarification request via websocket
         2. Waits for human response / timeout
-        3. Yields AgentRunResponseUpdate with the clarified answer
+        3. Yields AgentResponseUpdate with the clarified answer
         """
         # Normalize messages to string
         message_text = self._extract_message_text(messages)
@@ -205,7 +205,7 @@ class ProxyAgent(BaseAgent):
         message_id = str(uuid.uuid4())
 
         # Yield final assistant text update with explicit text content
-        text_update = AgentRunResponseUpdate(
+        text_update = AgentResponseUpdate(
             role=Role.ASSISTANT,
             contents=[TextContent(text=synthetic_reply)],
             author_name=self.name,
@@ -218,7 +218,7 @@ class ProxyAgent(BaseAgent):
 
         # Yield synthetic usage update for consistency
         # Use same message_id to indicate this is part of the same message
-        usage_update = AgentRunResponseUpdate(
+        usage_update = AgentResponseUpdate(
             role=Role.ASSISTANT,
             contents=[
                 UsageContent(
@@ -257,11 +257,13 @@ class ProxyAgent(BaseAgent):
         if isinstance(messages, list):
             if not messages:
                 return ""
-            if isinstance(messages[0], str):
-                return " ".join(messages)
-            if isinstance(messages[0], ChatMessage):
-                # Use .text property for each message
-                return " ".join(msg.text or "" for msg in messages)
+            texts = []
+            for msg in messages:
+                if isinstance(msg, ChatMessage):
+                    texts.append(msg.text or "")
+                else:
+                    texts.append(str(msg))
+            return " ".join(texts)
         return str(messages)
 
     async def _wait_for_user_clarification(

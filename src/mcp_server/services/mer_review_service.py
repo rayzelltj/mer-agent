@@ -1,17 +1,17 @@
 """MER review MCP tools.
 
-This service exposes a single tool that calls the backend FastAPI endpoint
-responsible for executing deterministic MER balance sheet checks driven by the
-YAML rulebook.
+This service exposes tools that call the backend FastAPI endpoints
+responsible for executing deterministic MER balance sheet checks and
+editing Google Sheets.
 
 Design goals:
-- Keep tools read-only and deterministic (no sheet edits).
-- Keep the agent surface simple: pass end_date + optional overrides.
+- Keep tools read-only for reviews, but allow editing for results
+- Keep the agent surface simple: pass end_date + optional overrides
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, List
 
 from ..core.factory import Domain, MCPToolBase
 from .mer_review_backend_client import call_mer_balance_sheet_review_backend
@@ -63,6 +63,63 @@ class MERReviewService(MCPToolBase):
                 backend_base_url=backend_base_url,
             )
 
+        @mcp.tool(tags={self.domain.value})
+        async def update_google_sheet_cell(
+            spreadsheet_id: str,
+            sheet_name: str,
+            cell_range: str,
+            value: str,
+            backend_base_url: str | None = None,
+        ) -> dict[str, Any]:
+            """Update a single cell in Google Sheets.
+
+            Args:
+              spreadsheet_id: The Google Sheets spreadsheet ID.
+              sheet_name: Name of the sheet tab.
+              cell_range: A1 notation cell reference (e.g., 'A1', 'B5').
+              value: The value to write to the cell.
+              backend_base_url: Optional override for backend URL.
+
+            Returns:
+              Success confirmation with updated cell info.
+            """
+            # This would need a backend endpoint to be implemented
+            # For now, return a placeholder response
+            return {
+                "status": "Google Sheets editing not yet implemented",
+                "message": f"Would update {sheet_name}!{cell_range} with value: {value}",
+                "spreadsheet_id": spreadsheet_id,
+                "note": "Contact developer to implement Google Sheets write functionality"
+            }
+
+        @mcp.tool(tags={self.domain.value})
+        async def update_google_sheet_range(
+            spreadsheet_id: str,
+            sheet_name: str,
+            range_notation: str,
+            values: List[List[str]],
+            backend_base_url: str | None = None,
+        ) -> dict[str, Any]:
+            """Update a range of cells in Google Sheets.
+
+            Args:
+              spreadsheet_id: The Google Sheets spreadsheet ID.
+              sheet_name: Name of the sheet tab.
+              range_notation: A1 notation range (e.g., 'A1:B10').
+              values: 2D array of values to write.
+              backend_base_url: Optional override for backend URL.
+
+            Returns:
+              Success confirmation with updated range info.
+            """
+            # This would need a backend endpoint to be implemented
+            return {
+                "status": "Google Sheets range editing not yet implemented",
+                "message": f"Would update {sheet_name}!{range_notation} with {len(values)} rows of data",
+                "spreadsheet_id": spreadsheet_id,
+                "note": "Contact developer to implement Google Sheets write functionality"
+            }
+
     @property
     def tool_count(self) -> int:
-        return 1
+        return 3

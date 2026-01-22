@@ -1,23 +1,25 @@
 """Agent template for building Foundry agents with Azure AI Search, optional MCP tool, and Code Interpreter (agent_framework version)."""
 
+from __future__ import annotations
 import logging
 from typing import List, Optional
 
 from agent_framework import (ChatAgent, ChatMessage, HostedCodeInterpreterTool,
                              Role)
-_AZURE_AI_IMPORT_ERROR: Exception | None = None
+from typing import Optional
+_AZURE_AI_IMPORT_ERROR: Optional[Exception] = None
 try:
     from agent_framework_azure_ai import AzureAIAgentClient  # Provided by agent_framework
 except Exception as exc:  # pragma: no cover
     AzureAIAgentClient = None  # type: ignore[assignment]
     _AZURE_AI_IMPORT_ERROR = exc
-from common.config.app_config import config
-from common.database.database_base import DatabaseBase
-from common.models.messages_af import TeamConfiguration
-from v4.common.services.team_service import TeamService
-from v4.config.agent_registry import agent_registry
-from v4.magentic_agents.common.lifecycle import AzureAgentBase
-from v4.magentic_agents.models.agent_models import MCPConfig, SearchConfig
+from src.backend.common.config.app_config import config
+from src.backend.common.database.database_base import DatabaseBase
+from src.backend.common.models.messages_af import TeamConfiguration
+from src.backend.v4.common.services.team_service import TeamService
+from src.backend.v4.config.agent_registry import agent_registry
+from src.backend.v4.magentic_agents.common.lifecycle import AzureAgentBase
+from src.backend.v4.magentic_agents.models.agent_models import MCPConfig, SearchConfig
 
 
 class FoundryAgentTemplate(AzureAgentBase):
@@ -120,7 +122,7 @@ class FoundryAgentTemplate(AzureAgentBase):
     # -------------------------
     # Azure Search helper
     # -------------------------
-    async def _create_azure_search_enabled_client(self, chatClient=None) -> Optional[AzureAIAgentClient]:
+    async def _create_azure_search_enabled_client(self, chatClient=None) -> Optional["AzureAIAgentClient"]: # type: ignore
         """
         Create a server-side Azure AI agent with Azure AI Search raw tool.
 
@@ -170,9 +172,11 @@ class FoundryAgentTemplate(AzureAgentBase):
             return None
 
         try:
+            if self.project_client is None:
+                self.logger.error("project_client is None; cannot enumerate connections.")
+                return None
             async for connection in self.project_client.connections.list():
                 if connection.type == ConnectionType.AZURE_AI_SEARCH:
-
                     if (
                         desired_connection_name
                         and connection.name == desired_connection_name
@@ -186,11 +190,9 @@ class FoundryAgentTemplate(AzureAgentBase):
 
             if not resolved_connection_id:
                 self.logger.error(
-                    "No Azure AI Search connection resolved. " "connection_name=%s",
+                    "No Azure AI Search connection resolved. connection_name=%s",
                     desired_connection_name,
                 )
-            #  return None
-
             self.logger.info(
                 "Using Azure AI Search connection (id=%s, requested_name=%s).",
                 resolved_connection_id,
@@ -202,6 +204,9 @@ class FoundryAgentTemplate(AzureAgentBase):
 
         # Create agent with raw tool
         try:
+            if self.client is None:
+                self.logger.error("self.client is None; cannot create agent.")
+                return None
             azure_agent = await self.client.create_agent(
                 model=self.model_deployment_name,
                 name=self.agent_name,
@@ -327,7 +332,8 @@ class FoundryAgentTemplate(AzureAgentBase):
         agent_saved = False
         async for update in self._agent.run_stream(messages):
             # Save agent ID only once on first update (agent ID won't change during streaming)
-            if not agent_saved and self._agent.chat_client.agent_id:
+            agent_id = getattr(self._agent.chat_client, "agent_id", None)
+            if not agent_saved and agent_id:
                 await self.save_database_team_agent()
                 agent_saved = True
             yield update
@@ -342,6 +348,7 @@ class FoundryAgentTemplate(AzureAgentBase):
                 self._use_azure_search
                 and self._azure_server_agent_id
                 and hasattr(self, "project_client")
+                and self.project_client is not None
             ):
                 try:
                     await self.project_client.agents.delete_agent(
